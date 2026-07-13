@@ -1,0 +1,16 @@
+build/
+build-release/
+cmake-build-*/
+.cache/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
