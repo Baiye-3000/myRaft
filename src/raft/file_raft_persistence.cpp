@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "raft/cluster_config.h"
+
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -74,6 +76,232 @@ std::uint32_t crc32c(const std::vector<std::uint8_t>& bytes) {
   return ~crc;
 }
 
+constexpr std::uint32_t kStateExtensionVersion = 2U;
+
+bool isAllowedEntryType(EntryType type) noexcept {
+  return type == EntryType::kNoOp || type == EntryType::kCommand ||
+         type == EntryType::kConfChange;
+}
+
+bool isValidEntryPayload(const LogEntry& entry) noexcept {
+  if (entry.type == EntryType::kNoOp) {
+    return entry.command.empty();
+  }
+  if (entry.type == EntryType::kCommand ||
+      entry.type == EntryType::kConfChange) {
+    return !entry.command.empty();
+  }
+  return false;
+}
+
+bool appendOptionalConfiguration(
+    std::vector<std::uint8_t>& output,
+    const std::optional<ClusterConfiguration>& config, std::string& error) {
+  output.push_back(config.has_value() ? 1U : 0U);
+  if (!config.has_value()) {
+    return true;
+  }
+  std::vector<std::uint8_t> encoded;
+  if (!encodeClusterConfiguration(*config, encoded, error)) {
+    return false;
+  }
+  append32(output, static_cast<std::uint32_t>(encoded.size()));
+  output.insert(output.end(), encoded.begin(), encoded.end());
+  return true;
+}
+
+bool readOptionalConfiguration(const std::vector<std::uint8_t>& input,
+                               std::size_t& offset,
+                               std::optional<ClusterConfiguration>& config,
+                               std::string& error) {
+  if (offset >= input.size()) {
+    error = "cluster configuration presence flag is truncated";
+    return false;
+  }
+  const std::uint8_t present = input[offset++];
+  if (present == 0U) {
+    config.reset();
+    return true;
+  }
+  if (present != 1U || input.size() - offset < 4) {
+    error = "cluster configuration presence flag is invalid";
+    return false;
+  }
+  const std::size_t encoded_size = read32(input.data() + offset);
+  offset += 4;
+  if (encoded_size == 0 || encoded_size > input.size() - offset) {
+    error = "cluster configuration payload is invalid";
+    return false;
+  }
+  ClusterConfiguration decoded;
+  if (!decodeClusterConfiguration(input, offset, decoded, error)) {
+    return false;
+  }
+  config = std::move(decoded);
+  return true;
+}
+
+bool appendOptionalMembershipOperation(
+    std::vector<std::uint8_t>& output,
+    const std::optional<MembershipOperation>& operation, std::string& error) {
+  output.push_back(operation.has_value() ? 1U : 0U);
+  if (!operation.has_value()) return true;
+  std::vector<std::uint8_t> encoded;
+  if (!encodeMembershipOperation(*operation, encoded, error)) return false;
+  append32(output, static_cast<std::uint32_t>(encoded.size()));
+  output.insert(output.end(), encoded.begin(), encoded.end());
+  return true;
+}
+
+bool readOptionalMembershipOperation(
+    const std::vector<std::uint8_t>& input, std::size_t& offset,
+    std::optional<MembershipOperation>& operation, std::string& error) {
+  if (offset >= input.size()) {
+    error = "membership operation presence flag is truncated";
+    return false;
+  }
+  const std::uint8_t present = input[offset++];
+  if (present == 0U) {
+    operation.reset();
+    return true;
+  }
+  if (present != 1U || input.size() - offset < 4U) {
+    error = "membership operation presence flag is invalid";
+    return false;
+  }
+  const std::size_t encoded_size = read32(input.data() + offset);
+  offset += 4U;
+  if (encoded_size == 0 || encoded_size > input.size() - offset) {
+    error = "membership operation payload is invalid";
+    return false;
+  }
+  const std::size_t end = offset + encoded_size;
+  MembershipOperation decoded;
+  if (!decodeMembershipOperation(input, offset, decoded, error) ||
+      offset != end) {
+    if (error.empty()) error = "membership operation payload is malformed";
+    return false;
+  }
+  operation = std::move(decoded);
+  return true;
+}
+
+bool appendStateExtensions(const RaftPersistentState& state,
+                           std::vector<std::uint8_t>& output,
+                           std::string& error) {
+  append32(output, kStateExtensionVersion);
+  if (!appendOptionalConfiguration(output, state.cluster_config, error) ||
+      !appendOptionalConfiguration(output, state.joint_config, error) ||
+      !appendOptionalMembershipOperation(
+          output, state.active_membership_operation, error) ||
+      !appendOptionalMembershipOperation(
+          output, state.completed_membership_operation, error)) {
+    return false;
+  }
+  return true;
+}
+
+bool readStateExtensions(const std::vector<std::uint8_t>& input,
+                         std::size_t& offset, RaftPersistentState& state,
+                         std::string& error) {
+  if (offset == input.size()) {
+    state.cluster_config.reset();
+    state.joint_config.reset();
+    state.active_membership_operation.reset();
+    state.completed_membership_operation.reset();
+    error.clear();
+    return true;
+  }
+  if (input.size() - offset < 4) {
+    error = "Raft state extension is truncated";
+    return false;
+  }
+  const std::uint32_t version = read32(input.data() + offset);
+  offset += 4;
+  if (version != 1U && version != kStateExtensionVersion) {
+    error = "Raft state extension version is unsupported";
+    return false;
+  }
+  if (!readOptionalConfiguration(input, offset, state.cluster_config, error) ||
+      !readOptionalConfiguration(input, offset, state.joint_config, error)) {
+    return false;
+  }
+  if (version == 1U) {
+    state.active_membership_operation.reset();
+    state.completed_membership_operation.reset();
+  } else if (!readOptionalMembershipOperation(
+                 input, offset, state.active_membership_operation, error) ||
+             !readOptionalMembershipOperation(
+                 input, offset, state.completed_membership_operation,
+                 error)) {
+    return false;
+  }
+  if (offset != input.size()) {
+    error = "Raft state image has trailing bytes";
+    return false;
+  }
+  error.clear();
+  return true;
+}
+
+bool isValidBoundary(const LogEntry& entry) noexcept {
+  return entry.type == EntryType::kNoOp && entry.command.empty() &&
+         !((entry.index == 0 && entry.term != 0) ||
+           (entry.index != 0 && entry.term == 0));
+}
+
+LogIndex firstIndex(const std::vector<LogEntry>& entries) noexcept {
+  return entries.front().index;
+}
+
+LogIndex lastIndex(const std::vector<LogEntry>& entries) noexcept {
+  return entries.back().index;
+}
+
+bool isValidCommitIndex(LogIndex commit_index,
+                        const std::vector<LogEntry>& entries) noexcept {
+  return !entries.empty() && commit_index <= lastIndex(entries);
+}
+
+bool validateEntries(const std::vector<LogEntry>& entries,
+                     std::string& error) {
+  if (entries.empty() || !isValidBoundary(entries.front())) {
+    error = "Raft log has invalid boundary";
+    return false;
+  }
+  for (std::size_t offset = 1; offset < entries.size(); ++offset) {
+    if (entries.front().index >
+            std::numeric_limits<LogIndex>::max() -
+                static_cast<LogIndex>(offset) ||
+        entries[offset].index !=
+            entries.front().index + static_cast<LogIndex>(offset) ||
+        entries[offset].term == 0 ||
+        !isAllowedEntryType(entries[offset].type) ||
+        !isValidEntryPayload(entries[offset])) {
+      error = "Raft log is not contiguous and valid";
+      return false;
+    }
+  }
+  error.clear();
+  return true;
+}
+
+bool validateEntryPayload(const LogEntry& entry, std::size_t offset,
+                          LogIndex base_index, std::string& error) {
+  if (entry.index != base_index + static_cast<LogIndex>(offset) ||
+      entry.term == 0 || !isAllowedEntryType(entry.type) ||
+      !isValidEntryPayload(entry) ||
+      entry.command.size() > kMaximumCommandSize ||
+      entry.command.size() >
+          static_cast<std::size_t>(
+              std::numeric_limits<std::uint32_t>::max())) {
+    error = "Raft entry is invalid";
+    return false;
+  }
+  error.clear();
+  return true;
+}
+
 bool writeAll(int fd, const std::vector<std::uint8_t>& bytes, off_t offset,
               std::string& error) {
   std::size_t written = 0;
@@ -118,11 +346,14 @@ bool readAll(int fd, std::vector<std::uint8_t>& bytes, off_t offset,
 
 bool encodeState(const RaftPersistentState& state,
                  std::vector<std::uint8_t>& output, std::string& error) {
-  if (state.entries.empty() || state.entries.size() > kMaximumEntryCount ||
-      state.commit_index >= state.entries.size() ||
+  if (state.entries.size() > kMaximumEntryCount ||
       state.entries.size() >
-          static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
-    error = "invalid Raft state image";
+          static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()) ||
+      !validateEntries(state.entries, error) ||
+      !isValidCommitIndex(state.commit_index, state.entries)) {
+    if (error.empty()) {
+      error = "invalid Raft state image";
+    }
     return false;
   }
   output.clear();
@@ -148,6 +379,9 @@ bool encodeState(const RaftPersistentState& state,
       error = "Raft state image exceeds persistent limit";
       return false;
     }
+  }
+  if (!appendStateExtensions(state, output, error)) {
+    return false;
   }
   return true;
 }
@@ -205,8 +439,14 @@ bool decodeState(const std::vector<std::uint8_t>& input,
     offset += command_size;
     decoded.entries.push_back(std::move(entry));
   }
-  if (offset != input.size()) {
-    error = "Raft state image has trailing bytes";
+  if (!readStateExtensions(input, offset, decoded, error)) {
+    return false;
+  }
+  if (!validateEntries(decoded.entries, error) ||
+      !isValidCommitIndex(decoded.commit_index, decoded.entries)) {
+    if (error.empty()) {
+      error = "Raft state image has invalid commit index";
+    }
     return false;
   }
   state = std::move(decoded);
@@ -225,9 +465,13 @@ bool encodeDelta(const RaftPersistentState& previous,
                  std::vector<std::uint8_t>& output, std::string& error) {
   if (state.current_term < previous.current_term ||
       state.commit_index < previous.commit_index ||
-      state.entries.empty() || state.entries.size() > kMaximumEntryCount ||
-      state.commit_index >= state.entries.size()) {
-    error = "invalid incremental Raft state";
+      !validateEntries(state.entries, error) ||
+      !validateEntries(previous.entries, error) ||
+      state.entries.size() > kMaximumEntryCount ||
+      !isValidCommitIndex(state.commit_index, state.entries)) {
+    if (error.empty()) {
+      error = "invalid incremental Raft state";
+    }
     return false;
   }
   const std::size_t shared_limit =
@@ -241,9 +485,10 @@ bool encodeDelta(const RaftPersistentState& previous,
       common_prefix >
           static_cast<std::size_t>(
               std::numeric_limits<std::uint64_t>::max())) {
-    error = "incremental Raft state changed the sentinel";
+    error = "incremental Raft state changed the boundary";
     return false;
   }
+  const LogIndex base_index = firstIndex(state.entries);
   const std::size_t append_count = state.entries.size() - common_prefix;
   if (append_count >
       static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
@@ -261,14 +506,7 @@ bool encodeDelta(const RaftPersistentState& previous,
   for (std::size_t index = common_prefix; index < state.entries.size();
        ++index) {
     const LogEntry& entry = state.entries[index];
-    if (entry.index != static_cast<LogIndex>(index) || entry.term == 0 ||
-        (entry.type != EntryType::kNoOp &&
-         entry.type != EntryType::kCommand) ||
-        (entry.type == EntryType::kNoOp && !entry.command.empty()) ||
-        entry.command.size() > kMaximumCommandSize ||
-        entry.command.size() >
-            static_cast<std::size_t>(
-                std::numeric_limits<std::uint32_t>::max())) {
+    if (!validateEntryPayload(entry, index, base_index, error)) {
       error = "incremental Raft suffix contains an invalid entry";
       return false;
     }
@@ -319,14 +557,18 @@ bool decodeDelta(const std::vector<std::uint8_t>& input,
   if (has_vote > 1U || (has_vote == 0U && voted_for != 0U) ||
       decoded.current_term < latest.current_term ||
       decoded.commit_index < latest.commit_index ||
+      !validateEntries(latest.entries, error) ||
       truncate_index == 0 ||
       truncate_index > latest.entries.size() ||
       truncate_index > kMaximumEntryCount ||
       append_count > kMaximumEntryCount -
                          static_cast<std::size_t>(truncate_index)) {
-    error = "Raft journal delta metadata is invalid";
+    if (error.empty()) {
+      error = "Raft journal delta metadata is invalid";
+    }
     return false;
   }
+  const LogIndex base_index = firstIndex(latest.entries);
   if (has_vote == 1U) {
     decoded.voted_for = voted_for;
   }
@@ -350,11 +592,8 @@ bool decodeDelta(const std::vector<std::uint8_t>& input,
     const std::size_t command_size = read32(input.data() + offset);
     offset += 4;
     const LogIndex expected_index =
-        truncate_index + static_cast<LogIndex>(count);
-    if (entry.index != expected_index || entry.term == 0 ||
-        (entry.type != EntryType::kNoOp &&
-         entry.type != EntryType::kCommand) ||
-        command_size > kMaximumCommandSize ||
+        base_index + truncate_index + static_cast<LogIndex>(count);
+    if (command_size > kMaximumCommandSize ||
         command_size > input.size() - offset) {
       error = "Raft journal delta entry is invalid";
       return false;
@@ -362,17 +601,37 @@ bool decodeDelta(const std::vector<std::uint8_t>& input,
     entry.command.assign(
         reinterpret_cast<const char*>(input.data() + offset), command_size);
     offset += command_size;
+    if (!validateEntryPayload(entry, truncate_index + count, base_index,
+                            error) ||
+        entry.index != expected_index) {
+      if (error.empty()) {
+        error = "Raft journal delta entry is invalid";
+      }
+      return false;
+    }
     if (entry.type == EntryType::kNoOp && !entry.command.empty()) {
       error = "Raft journal delta no-op contains command bytes";
+      return false;
+    }
+    if (entry.type == EntryType::kConfChange && entry.command.empty()) {
+      error = "Raft journal delta conf change is empty";
       return false;
     }
     decoded.entries.push_back(std::move(entry));
   }
   if (offset != input.size() ||
-      decoded.commit_index >= decoded.entries.size()) {
-    error = "Raft journal delta has invalid trailing data or commit index";
+      !validateEntries(decoded.entries, error) ||
+      !isValidCommitIndex(decoded.commit_index, decoded.entries)) {
+    if (error.empty()) {
+      error = "Raft journal delta has invalid trailing data or commit index";
+    }
     return false;
   }
+  decoded.cluster_config = latest.cluster_config;
+  decoded.joint_config = latest.joint_config;
+  decoded.active_membership_operation = latest.active_membership_operation;
+  decoded.completed_membership_operation =
+      latest.completed_membership_operation;
   latest = std::move(decoded);
   return true;
 }
@@ -581,7 +840,16 @@ bool FileRaftPersistence::save(const RaftPersistentState& state,
     return false;
   }
   std::vector<std::uint8_t> payload;
-  const bool write_delta = last_state_.has_value();
+  const bool write_delta =
+      last_state_.has_value() && !last_state_->entries.empty() &&
+      !state.entries.empty() &&
+      last_state_->entries.front() == state.entries.front() &&
+      last_state_->cluster_config == state.cluster_config &&
+      last_state_->joint_config == state.joint_config &&
+      last_state_->active_membership_operation ==
+          state.active_membership_operation &&
+      last_state_->completed_membership_operation ==
+          state.completed_membership_operation;
   if ((!write_delta && !encodeState(state, payload, error)) ||
       (write_delta &&
        !encodeDelta(*last_state_, state, payload, error))) {

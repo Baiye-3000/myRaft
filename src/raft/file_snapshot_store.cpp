@@ -402,4 +402,305 @@ bool FileSnapshotStore::load(
   return true;
 }
 
+bool FileSnapshotStore::fileSize(std::uint64_t& size,
+                                 std::string& error) const {
+  const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno == ENOENT) {
+      error = "snapshot file is absent";
+      return false;
+    }
+    error = std::string("snapshot open failed: ") + std::strerror(errno);
+    return false;
+  }
+  struct stat status {};
+  const bool success = ::fstat(fd, &status) == 0;
+  const int failure = errno;
+  static_cast<void>(::close(fd));
+  if (!success) {
+    error = std::string("snapshot stat failed: ") + std::strerror(failure);
+    return false;
+  }
+  if (status.st_size < 0) {
+    error = "snapshot file has invalid size";
+    return false;
+  }
+  size = static_cast<std::uint64_t>(status.st_size);
+  error.clear();
+  return true;
+}
+
+bool FileSnapshotStore::readBytes(std::uint64_t offset,
+                                  std::size_t max_count,
+                                  std::string& chunk, bool& eof,
+                                  std::string& error) const {
+  chunk.clear();
+  eof = false;
+  if (max_count == 0) {
+    error = "snapshot read size must be positive";
+    return false;
+  }
+  const int fd = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    error = std::string("snapshot open failed: ") + std::strerror(errno);
+    return false;
+  }
+  struct stat status {};
+  bool success = ::fstat(fd, &status) == 0;
+  if (!success) {
+    error = std::string("snapshot stat failed: ") + std::strerror(errno);
+    static_cast<void>(::close(fd));
+    return false;
+  }
+  if (status.st_size < 0 ||
+      static_cast<std::uint64_t>(status.st_size) < offset) {
+    error = "snapshot read offset is out of range";
+    static_cast<void>(::close(fd));
+    return false;
+  }
+  const std::uint64_t remaining =
+      static_cast<std::uint64_t>(status.st_size) - offset;
+  const std::size_t to_read =
+      static_cast<std::size_t>(std::min<std::uint64_t>(
+          remaining, static_cast<std::uint64_t>(max_count)));
+  chunk.resize(to_read);
+  std::size_t read_total = 0;
+  while (read_total < to_read) {
+    const ssize_t result =
+        ::pread(fd, chunk.data() + read_total, to_read - read_total,
+                static_cast<off_t>(offset + read_total));
+    if (result > 0) {
+      read_total += static_cast<std::size_t>(result);
+    } else if (result < 0 && errno == EINTR) {
+      continue;
+    } else {
+      error = result == 0 ? "snapshot file ended unexpectedly"
+                          : std::string("snapshot read failed: ") +
+                                std::strerror(errno);
+      success = false;
+      break;
+    }
+  }
+  static_cast<void>(::close(fd));
+  if (!success) {
+    chunk.clear();
+    return false;
+  }
+  eof = offset + read_total >= static_cast<std::uint64_t>(status.st_size);
+  error.clear();
+  return true;
+}
+
+SnapshotFileReceiver::SnapshotFileReceiver(std::string destination_path)
+    : destination_path_(std::move(destination_path)),
+      temporary_path_(destination_path_ + ".recv.tmp") {}
+
+void SnapshotFileReceiver::cancel() noexcept {
+  active_ = false;
+  received_size_ = 0;
+  last_included_index_ = 0;
+  last_included_term_ = 0;
+  static_cast<void>(::unlink(temporary_path_.c_str()));
+}
+
+bool SnapshotFileReceiver::active() const noexcept { return active_; }
+
+bool SnapshotFileReceiver::begin(LogIndex last_included_index,
+                                 Term last_included_term,
+                                 std::string& error) {
+  if ((last_included_index == 0) != (last_included_term == 0)) {
+    error = "snapshot boundary index and term are inconsistent";
+    return false;
+  }
+  static_cast<void>(::unlink(temporary_path_.c_str()));
+  const int fd = ::open(temporary_path_.c_str(),
+                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                        S_IRUSR | S_IWUSR);
+  if (fd < 0) {
+    error = std::string("snapshot receive open failed: ") +
+            std::strerror(errno);
+    return false;
+  }
+  static_cast<void>(::close(fd));
+  last_included_index_ = last_included_index;
+  last_included_term_ = last_included_term;
+  received_size_ = 0;
+  active_ = true;
+  error.clear();
+  return true;
+}
+
+bool SnapshotFileReceiver::appendChunk(LogIndex last_included_index,
+                                       Term last_included_term,
+                                       std::uint64_t offset,
+                                       const std::string& data, bool done,
+                                       std::string& error) {
+  if (offset == 0 && !active_) {
+    if (!begin(last_included_index, last_included_term, error)) {
+      return false;
+    }
+  }
+  if (!active_) {
+    error = "snapshot receive has no active transfer";
+    return false;
+  }
+  if (last_included_index != last_included_index_ ||
+      last_included_term != last_included_term_) {
+    error = "snapshot receive boundary changed mid-stream";
+    return false;
+  }
+  if (offset != received_size_) {
+    error = "snapshot receive offset is out of order";
+    return false;
+  }
+  if (data.empty() && !done) {
+    error = "snapshot receive chunk is empty";
+    return false;
+  }
+  if (!data.empty()) {
+    const int fd =
+        ::open(temporary_path_.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+      error = std::string("snapshot receive open failed: ") +
+              std::strerror(errno);
+      return false;
+    }
+    std::size_t written = 0;
+    bool success = true;
+    while (written < data.size()) {
+      const ssize_t result =
+          ::pwrite(fd, data.data() + written, data.size() - written,
+                   static_cast<off_t>(offset + written));
+      if (result > 0) {
+        written += static_cast<std::size_t>(result);
+      } else if (result < 0 && errno == EINTR) {
+        continue;
+      } else {
+        error = std::string("snapshot receive write failed: ") +
+                (result == 0 ? "no progress" : std::strerror(errno));
+        success = false;
+        break;
+      }
+    }
+    if (success && ::fdatasync(fd) != 0) {
+      error = std::string("snapshot receive sync failed: ") +
+              std::strerror(errno);
+      success = false;
+    }
+    static_cast<void>(::close(fd));
+    if (!success) {
+      cancel();
+      return false;
+    }
+    received_size_ += static_cast<std::uint64_t>(data.size());
+  }
+  if (!done) {
+    error.clear();
+    return true;
+  }
+  if (received_size_ == 0) {
+    error = "snapshot receive completed without data";
+    cancel();
+    return false;
+  }
+  error.clear();
+  return true;
+}
+
+bool SnapshotFileReceiver::finishAndLoad(
+    std::optional<StateMachineSnapshot>& snapshot, std::string& error) {
+  if (!active_ || received_size_ == 0) {
+    error = "snapshot receive has no completed transfer";
+    return false;
+  }
+  const int fd = ::open(temporary_path_.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    error = std::string("snapshot receive open failed: ") +
+            std::strerror(errno);
+    cancel();
+    return false;
+  }
+  struct stat status {};
+  bool success = ::fstat(fd, &status) == 0;
+  if (!success) {
+    error = std::string("snapshot receive stat failed: ") +
+            std::strerror(errno);
+    static_cast<void>(::close(fd));
+    cancel();
+    return false;
+  }
+  if (status.st_size < static_cast<off_t>(kHeaderSize) ||
+      status.st_size >
+          static_cast<off_t>(kHeaderSize + kMaximumPayloadSize) ||
+      static_cast<std::uint64_t>(status.st_size) != received_size_) {
+    error = "snapshot receive file has invalid size";
+    static_cast<void>(::close(fd));
+    cancel();
+    return false;
+  }
+  std::vector<std::uint8_t> file(static_cast<std::size_t>(status.st_size));
+  success = readAll(fd, file, error);
+  static_cast<void>(::close(fd));
+  if (!success) {
+    cancel();
+    return false;
+  }
+  if (!std::equal(kMagic.begin(), kMagic.end(), file.begin()) ||
+      read32(file.data() + 8) != kVersion) {
+    error = "snapshot receive has invalid magic or version";
+    cancel();
+    return false;
+  }
+  const std::size_t payload_size = read32(file.data() + 12);
+  if (payload_size != file.size() - kHeaderSize) {
+    error = "snapshot receive payload length does not match file";
+    cancel();
+    return false;
+  }
+  std::vector<std::uint8_t> payload(file.begin() +
+                                          static_cast<std::ptrdiff_t>(
+                                              kHeaderSize),
+                                      file.end());
+  if (read32(file.data() + 16) != crc32c(payload)) {
+    error = "snapshot receive checksum mismatch";
+    cancel();
+    return false;
+  }
+  StateMachineSnapshot decoded;
+  if (!decode(payload, decoded, error)) {
+    cancel();
+    return false;
+  }
+  if (decoded.last_included_index != last_included_index_ ||
+      decoded.last_included_term != last_included_term_) {
+    error = "snapshot receive boundary does not match payload";
+    cancel();
+    return false;
+  }
+  if (::rename(temporary_path_.c_str(), destination_path_.c_str()) != 0) {
+    error = std::string("snapshot receive rename failed: ") +
+            std::strerror(errno);
+    cancel();
+    return false;
+  }
+  const std::string parent = parentDirectory(destination_path_);
+  const int directory_fd =
+      ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory_fd < 0 || ::fsync(directory_fd) != 0) {
+    error = std::string("snapshot receive directory sync failed: ") +
+            std::strerror(errno);
+    if (directory_fd >= 0) {
+      static_cast<void>(::close(directory_fd));
+    }
+    cancel();
+    return false;
+  }
+  static_cast<void>(::close(directory_fd));
+  active_ = false;
+  received_size_ = 0;
+  snapshot = std::move(decoded);
+  error.clear();
+  return true;
+}
+
 }  // namespace distributed_kv::raft

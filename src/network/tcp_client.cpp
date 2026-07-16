@@ -61,6 +61,8 @@ std::uint64_t generateClientId() {
   return client_id;
 }
 
+std::uint64_t generateOperationId() { return generateClientId(); }
+
 }  // namespace
 
 TcpClient::TcpClient(ClientConfig config) : config_(std::move(config)) {
@@ -94,6 +96,48 @@ bool TcpClient::remove(const std::string& key, Response& response,
   return execute(Request{MessageType::kDeleteRequest, request_id, key, "",
                          config_.client_id},
                  response, error);
+}
+
+bool TcpClient::addNode(const MemberEndpoint& member, Response& response,
+                        std::string& error, std::uint64_t operation_id) {
+  const std::uint64_t request_id =
+      next_request_id_.fetch_add(1, std::memory_order_relaxed);
+  Request request;
+  request.type = MessageType::kAddNodeRequest;
+  request.request_id = request_id;
+  request.client_id = config_.client_id;
+  request.operation_id =
+      operation_id == 0 ? generateOperationId() : operation_id;
+  request.node_id = member.node_id;
+  request.client_host = member.client_host;
+  request.client_port = member.client_port;
+  request.peer_host = member.peer_host;
+  request.peer_port = member.peer_port;
+  return execute(request, response, error);
+}
+
+bool TcpClient::removeNode(std::uint64_t node_id, Response& response,
+                           std::string& error, std::uint64_t operation_id) {
+  const std::uint64_t request_id =
+      next_request_id_.fetch_add(1, std::memory_order_relaxed);
+  Request request;
+  request.type = MessageType::kRemoveNodeRequest;
+  request.request_id = request_id;
+  request.client_id = config_.client_id;
+  request.operation_id =
+      operation_id == 0 ? generateOperationId() : operation_id;
+  request.node_id = node_id;
+  return execute(request, response, error);
+}
+
+bool TcpClient::listMembers(Response& response, std::string& error) {
+  const std::uint64_t request_id =
+      next_request_id_.fetch_add(1, std::memory_order_relaxed);
+  Request request;
+  request.type = MessageType::kListMembersRequest;
+  request.request_id = request_id;
+  request.client_id = config_.client_id;
+  return execute(request, response, error);
 }
 
 bool TcpClient::execute(const Request& request, Response& response,

@@ -66,7 +66,7 @@ distributed_kv::server::ClusterNodeEndpoint parseMember(
 int main(int argc, char** argv) {
   if (argc < 5) {
     std::cerr << "usage: dkv_node <node-id> <data-dir> "
-                 "<member> <member> [member...]\n"
+                 "[--learner] <member> <member> [member...]\n"
                  "member: id,client-host,client-port,peer-host,peer-port\n";
     return 2;
   }
@@ -74,8 +74,29 @@ int main(int argc, char** argv) {
     distributed_kv::server::NodeServiceConfig config;
     config.node_id = parseUnsigned(argv[1], "node id");
     config.data_directory = argv[2];
-    for (int index = 3; index < argc; ++index) {
+    int first_member = 3;
+    if (std::string(argv[first_member]) == "--learner") {
+      config.learner = true;
+      ++first_member;
+    }
+    if (argc - first_member < 2) {
+      throw std::invalid_argument("at least two member endpoints are required");
+    }
+    for (int index = first_member; index < argc; ++index) {
       config.members.push_back(parseMember(argv[index]));
+    }
+    const char* pause_stage =
+        std::getenv("DKV_TEST_MEMBERSHIP_PAUSE_STAGE");
+    const char* pause_directory =
+        std::getenv("DKV_TEST_MEMBERSHIP_PAUSE_DIRECTORY");
+    const char* peer_fault_directory =
+        std::getenv("DKV_TEST_PEER_FAULT_DIRECTORY");
+    if (pause_stage != nullptr) config.membership_pause_stage = pause_stage;
+    if (pause_directory != nullptr) {
+      config.membership_pause_directory = pause_directory;
+    }
+    if (peer_fault_directory != nullptr) {
+      config.peer_fault_directory = peer_fault_directory;
     }
     std::filesystem::create_directories(config.data_directory);
 

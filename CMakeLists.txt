@@ -65,6 +65,7 @@ target_compile_options(distributed_kv_network
 )
 
 add_library(distributed_kv_raft
+    src/raft/cluster_config.cpp
     src/raft/file_raft_persistence.cpp
     src/raft/file_snapshot_store.cpp
     src/raft/kv_command.cpp
@@ -159,6 +160,24 @@ target_compile_options(dkv_node
 
 add_executable(dkv_client
     src/client/main.cpp
+)
+
+add_executable(dkv_admin
+    src/client/admin_main.cpp
+)
+
+target_link_libraries(dkv_admin
+    PRIVATE
+        distributed_kv_network
+)
+
+target_compile_options(dkv_admin
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wshadow
 )
 
 target_link_libraries(dkv_client

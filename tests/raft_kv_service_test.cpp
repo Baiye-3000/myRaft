@@ -1,7 +1,13 @@
+#include "raft/file_raft_persistence.h"
+#include "raft/file_snapshot_store.h"
 #include "raft/raft_kv_service.h"
 #include "storage/kv_store.h"
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
+#include <cstdlib>
+#include <deque>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -10,6 +16,10 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -55,7 +65,7 @@ std::string encodedSet(std::uint64_t client_id,
 TEST(RaftKVServiceTest, FollowerRejectsSubmission) {
   storage::KVStore store;
   RaftKVService service(
-      NodeConfig{1, {2, 3}, 100, 100, 20, 64, 1}, store);
+      NodeConfig{1, {2, 3}, std::nullopt, 100, 100, 20, 64, 1}, store);
   std::string error;
 
   const SubmitResult result = service.submit(
@@ -70,7 +80,7 @@ TEST(RaftKVServiceTest, FollowerRejectsSubmission) {
 TEST(RaftKVServiceTest, SingleNodeSubmissionAppliesSynchronously) {
   storage::KVStore store;
   RaftKVService service(
-      NodeConfig{1, {}, 100, 100, 20, 64, 1}, store);
+      NodeConfig{1, {}, std::nullopt, 100, 100, 20, 64, 1}, store);
   std::string error;
   EXPECT_TRUE(service.tick(100, error).empty()) << error;
   ASSERT_EQ(service.raftNode().role(), Role::kLeader);
@@ -110,7 +120,7 @@ TEST(RaftKVServiceTest, RestoresSnapshotAndReplaysCommittedSuffix) {
   storage::KVStore store;
 
   RaftKVService service(
-      NodeConfig{1, {}, 100, 100, 20, 64, 1}, store,
+      NodeConfig{1, {}, std::nullopt, 100, 100, 20, 64, 1}, store,
       &persistence, &snapshot);
 
   EXPECT_EQ(service.lastApplied(), 3U);
@@ -137,7 +147,7 @@ TEST(RaftKVServiceTest, RejectsSnapshotWithMismatchedLogBoundary) {
 
   EXPECT_THROW(
       RaftKVService(
-          NodeConfig{1, {}, 100, 100, 20, 64, 1}, store,
+          NodeConfig{1, {}, std::nullopt, 100, 100, 20, 64, 1}, store,
           &persistence, &snapshot),
       std::runtime_error);
   EXPECT_EQ(store.size(), 0U);
@@ -255,7 +265,7 @@ class ServiceCluster {
                  std::uint64_t election_timeout) {
     auto member = std::make_unique<Member>();
     member->service = std::make_unique<RaftKVService>(
-        NodeConfig{node_id, std::move(peers), election_timeout,
+        NodeConfig{node_id, std::move(peers), std::nullopt, election_timeout,
                    election_timeout, 20, 64, node_id},
         member->store);
     members_.emplace(node_id, std::move(member));
@@ -303,6 +313,287 @@ TEST(RaftKVServiceTest, AppliesOnlyAfterMajorityCommit) {
               std::optional<std::string>("tom"));
     EXPECT_EQ(cluster.service(node_id).lastApplied(), 2U);
   }
+}
+
+class SnapshotCompactionFixture : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    std::array<char, 64> directory_template{};
+    const std::string prefix = "/tmp/distributed-kv-snapshot-XXXXXX";
+    std::copy(prefix.begin(), prefix.end(), directory_template.begin());
+    char* created = ::mkdtemp(directory_template.data());
+    ASSERT_NE(created, nullptr);
+    directory_ = created;
+    journal_path_ = directory_ + "/raft.wal";
+    snapshot_path_ = directory_ + "/state.snapshot";
+  }
+
+  void TearDown() override {
+    static_cast<void>(::unlink(journal_path_.c_str()));
+    static_cast<void>(::unlink((journal_path_ + ".leader").c_str()));
+    static_cast<void>(::unlink((journal_path_ + ".follower").c_str()));
+    static_cast<void>(::unlink((journal_path_ + ".compact.tmp").c_str()));
+    static_cast<void>(::unlink(snapshot_path_.c_str()));
+    static_cast<void>(::unlink((snapshot_path_ + ".leader").c_str()));
+    static_cast<void>(::unlink((snapshot_path_ + ".leader.tmp").c_str()));
+    static_cast<void>(::unlink((snapshot_path_ + ".leader.recv.tmp").c_str()));
+    static_cast<void>(::unlink((snapshot_path_ + ".follower").c_str()));
+    static_cast<void>(::unlink((snapshot_path_ + ".follower.tmp").c_str()));
+    static_cast<void>(::unlink((snapshot_path_ + ".follower.recv.tmp").c_str()));
+    static_cast<void>(::unlink((snapshot_path_ + ".tmp").c_str()));
+    static_cast<void>(::rmdir(directory_.c_str()));
+  }
+
+  std::string directory_;
+  std::string journal_path_;
+  std::string snapshot_path_;
+};
+
+// Verifies threshold-gated snapshot publication compacts the durable journal.
+TEST_F(SnapshotCompactionFixture, PublishesSnapshotAndCompactsJournal) {
+  storage::KVStore store;
+  FileRaftPersistence persistence(journal_path_);
+  FileSnapshotStore snapshot_store(snapshot_path_);
+  RaftKVService service(NodeConfig{1, {}, std::nullopt, 100, 100, 20, 64, 1}, store,
+                        &persistence);
+  std::string error;
+  ASSERT_TRUE(service.tick(100, error).empty()) << error;
+  ASSERT_EQ(service.lastApplied(), 1U);
+
+  SnapshotPublishResult result;
+  ASSERT_TRUE(service.tryPublishSnapshot(snapshot_store, 2, result, error))
+      << error;
+  EXPECT_FALSE(result.performed);
+
+  SubmitResult first = service.submit(
+      KVCommand{KVCommandType::kSet, 10, 1, "name", "tom"}, error);
+  ASSERT_EQ(first.status, SubmitStatus::kApplied) << error;
+  EXPECT_EQ(service.lastApplied(), 2U);
+
+  ASSERT_TRUE(service.tryPublishSnapshot(snapshot_store, 2, result, error))
+      << error;
+  ASSERT_TRUE(result.performed);
+  EXPECT_EQ(result.boundary_index, 2U);
+  EXPECT_EQ(service.lastSnapshotIndex(), 2U);
+  EXPECT_EQ(service.raftNode().log().firstIndex(), 2U);
+  EXPECT_EQ(service.raftNode().log().lastIndex(), 2U);
+  EXPECT_EQ(service.raftNode().log().persistentEntries().size(), 1U);
+
+  std::optional<StateMachineSnapshot> loaded;
+  ASSERT_TRUE(snapshot_store.load(loaded, error)) << error;
+  ASSERT_TRUE(loaded.has_value());
+  EXPECT_EQ(loaded->last_included_index, 2U);
+  ASSERT_EQ(loaded->entries.size(), 1U);
+  EXPECT_EQ(loaded->entries.front().first, "name");
+  EXPECT_EQ(loaded->entries.front().second, "tom");
+}
+
+// Verifies a published snapshot plus compacted journal rebuild on restart.
+TEST_F(SnapshotCompactionFixture, RestartsFromPublishedSnapshot) {
+  storage::KVStore store;
+  FileRaftPersistence persistence(journal_path_);
+  FileSnapshotStore snapshot_store(snapshot_path_);
+  {
+    RaftKVService service(NodeConfig{1, {}, std::nullopt, 100, 100, 20, 64, 1}, store,
+                          &persistence);
+    std::string error;
+    ASSERT_TRUE(service.tick(100, error).empty()) << error;
+    for (std::uint64_t index = 1; index <= 3; ++index) {
+      SubmitResult submission = service.submit(
+          KVCommand{KVCommandType::kSet, 20 + index, index,
+                    "key" + std::to_string(index),
+                    "value" + std::to_string(index)},
+          error);
+      ASSERT_EQ(submission.status, SubmitStatus::kApplied) << error;
+    }
+    SnapshotPublishResult result;
+    ASSERT_TRUE(service.tryPublishSnapshot(snapshot_store, 2, result, error))
+        << error;
+    ASSERT_TRUE(result.performed);
+  }
+
+  std::optional<StateMachineSnapshot> snapshot;
+  std::string error;
+  ASSERT_TRUE(snapshot_store.load(snapshot, error)) << error;
+  ASSERT_TRUE(snapshot.has_value());
+
+  storage::KVStore recovered_store;
+  RaftKVService recovered(NodeConfig{1, {}, std::nullopt, 100, 100, 20, 64, 1},
+                          recovered_store, &persistence, &*snapshot);
+  EXPECT_EQ(recovered.lastApplied(), snapshot->last_included_index);
+  EXPECT_EQ(recovered.getApplied("key1"),
+            std::optional<std::string>("value1"));
+  EXPECT_EQ(recovered.getApplied("key2"),
+            std::optional<std::string>("value2"));
+  EXPECT_EQ(recovered.getApplied("key3"),
+            std::optional<std::string>("value3"));
+  EXPECT_EQ(recovered.raftNode().log().firstIndex(),
+            snapshot->last_included_index);
+}
+
+// Verifies Leaders emit InstallSnapshot when a follower lags the boundary.
+TEST_F(SnapshotCompactionFixture, LeaderSendsInstallSnapshotToLaggingPeer) {
+  storage::KVStore leader_store;
+  FileRaftPersistence leader_wal(journal_path_ + ".leader");
+  FileSnapshotStore leader_snapshot(snapshot_path_ + ".leader");
+  RaftKVService leader(NodeConfig{1, {2, 3}, std::nullopt, 100, 100, 20, 64, 1},
+                       leader_store, &leader_wal, nullptr,
+                       &leader_snapshot);
+
+  storage::KVStore caught_up_store;
+  RaftKVService caught_up(NodeConfig{2, {1, 3}, std::nullopt, 100, 100, 20, 64, 2},
+                          caught_up_store);
+
+  std::string error;
+  static_cast<void>(leader.tick(100, error));
+  static_cast<void>(leader.handleRequestVoteResponse(
+      2, RequestVoteResponse{1, 1, true}, error));
+  ASSERT_EQ(leader.raftNode().role(), Role::kLeader);
+
+  SubmitResult write = leader.submit(
+      KVCommand{KVCommandType::kSet, 30, 1, "name", "tom"}, error);
+  ASSERT_EQ(write.status, SubmitStatus::kPending) << error;
+  std::deque<OutboundRpc> replication(
+      write.outbound.begin(), write.outbound.end());
+  std::size_t replication_steps = 0;
+  while (!replication.empty()) {
+    ASSERT_LT(replication_steps++, 32U);
+    OutboundRpc rpc = std::move(replication.front());
+    replication.pop_front();
+    if (rpc.destination != 2) {
+      continue;
+    }
+    const auto& append =
+        std::get<AppendEntriesRequest>(rpc.payload);
+    const AppendEntriesResponse response =
+        caught_up.handleAppendEntries(append, error);
+    ASSERT_TRUE(error.empty()) << error;
+    const std::vector<OutboundRpc> follow_up =
+        leader.handleAppendEntriesResponse(2, response, error);
+    ASSERT_TRUE(error.empty()) << error;
+    for (const OutboundRpc& next : follow_up) {
+      replication.push_back(next);
+    }
+  }
+  ASSERT_TRUE(leader.takeResult(write.log_index).has_value());
+
+  SnapshotPublishResult published;
+  ASSERT_TRUE(
+      leader.tryPublishSnapshot(leader_snapshot, 1, published, error))
+      << error;
+  ASSERT_TRUE(published.performed);
+
+  std::vector<OutboundRpc> outbound = leader.tick(20, error);
+  ASSERT_TRUE(error.empty()) << error;
+  ASSERT_EQ(outbound.size(), 2U);
+  const auto install = std::find_if(
+      outbound.begin(), outbound.end(),
+      [](const OutboundRpc& rpc) {
+        return rpc.destination == 3U &&
+               std::holds_alternative<InstallSnapshotRequest>(rpc.payload);
+      });
+  EXPECT_NE(install, outbound.end());
+}
+
+// Verifies a lagging follower installs the Leader snapshot and catches up.
+TEST_F(SnapshotCompactionFixture, FollowerCatchesUpViaInstallSnapshot) {
+  const std::string leader_snap_path = snapshot_path_ + ".leader2";
+  const std::string leader_wal_path = journal_path_ + ".leader2";
+  const std::string follower_snap_path = snapshot_path_ + ".follower2";
+  const std::string follower_wal_path = journal_path_ + ".follower2";
+
+  storage::KVStore leader_store;
+  FileRaftPersistence leader_wal(leader_wal_path);
+  FileSnapshotStore leader_snapshot(leader_snap_path);
+  RaftKVService leader(NodeConfig{1, {2, 3}, std::nullopt, 100, 100, 20, 64, 1},
+                       leader_store, &leader_wal, nullptr,
+                       &leader_snapshot);
+
+  storage::KVStore caught_up_store;
+  RaftKVService caught_up(NodeConfig{2, {1, 3}, std::nullopt, 100, 100, 20, 64, 2},
+                          caught_up_store);
+
+  std::string error;
+  static_cast<void>(leader.tick(100, error));
+  static_cast<void>(leader.handleRequestVoteResponse(
+      2, RequestVoteResponse{1, 1, true}, error));
+  ASSERT_EQ(leader.raftNode().role(), Role::kLeader);
+
+  SubmitResult write = leader.submit(
+      KVCommand{KVCommandType::kSet, 30, 1, "name", "tom"}, error);
+  ASSERT_EQ(write.status, SubmitStatus::kPending) << error;
+  std::deque<OutboundRpc> replication(
+      write.outbound.begin(), write.outbound.end());
+  std::size_t replication_steps = 0;
+  while (!replication.empty()) {
+    ASSERT_LT(replication_steps++, 32U);
+    OutboundRpc rpc = std::move(replication.front());
+    replication.pop_front();
+    if (rpc.destination != 2) {
+      continue;
+    }
+    const auto& append =
+        std::get<AppendEntriesRequest>(rpc.payload);
+    const AppendEntriesResponse response =
+        caught_up.handleAppendEntries(append, error);
+    ASSERT_TRUE(error.empty()) << error;
+    const std::vector<OutboundRpc> follow_up =
+        leader.handleAppendEntriesResponse(2, response, error);
+    ASSERT_TRUE(error.empty()) << error;
+    for (const OutboundRpc& next : follow_up) {
+      replication.push_back(next);
+    }
+  }
+  ASSERT_TRUE(leader.takeResult(write.log_index).has_value());
+
+  SnapshotPublishResult published;
+  ASSERT_TRUE(
+      leader.tryPublishSnapshot(leader_snapshot, 1, published, error))
+      << error;
+  ASSERT_TRUE(published.performed);
+
+  storage::KVStore lagging_store;
+  FileRaftPersistence lagging_wal(follower_wal_path);
+  FileSnapshotStore lagging_snapshot(follower_snap_path);
+  RaftKVService lagging(NodeConfig{3, {1, 2}, std::nullopt, 100, 100, 20, 64, 3},
+                        lagging_store, &lagging_wal, nullptr,
+                        &lagging_snapshot);
+
+  std::vector<OutboundRpc> pending = leader.tick(20, error);
+  ASSERT_TRUE(error.empty()) << error;
+  pending.erase(
+      std::remove_if(pending.begin(), pending.end(),
+                     [](const OutboundRpc& rpc) {
+                       return rpc.destination != 3U;
+                     }),
+      pending.end());
+  ASSERT_FALSE(pending.empty());
+  ASSERT_TRUE(std::holds_alternative<InstallSnapshotRequest>(
+      pending.front().payload));
+
+  std::size_t steps = 0;
+  while (!pending.empty()) {
+    ASSERT_LT(steps++, 32U);
+    std::vector<OutboundRpc> next;
+    for (OutboundRpc& rpc : pending) {
+      ASSERT_EQ(rpc.destination, 3U);
+      const InstallSnapshotRequest request =
+          std::get<InstallSnapshotRequest>(rpc.payload);
+      const InstallSnapshotResponse response =
+          lagging.handleInstallSnapshot(request, lagging_snapshot, error);
+      ASSERT_TRUE(error.empty()) << error;
+      next = leader.handleInstallSnapshotResponse(3, response,
+                                                  leader_snapshot, error);
+      ASSERT_TRUE(error.empty()) << error;
+    }
+    pending = std::move(next);
+  }
+
+  EXPECT_EQ(lagging.lastApplied(), published.boundary_index);
+  EXPECT_EQ(lagging.getApplied("name"),
+            std::optional<std::string>("tom"));
+  EXPECT_EQ(lagging.raftNode().log().firstIndex(),
+            published.boundary_index);
 }
 
 }  // namespace

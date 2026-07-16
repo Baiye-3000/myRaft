@@ -18,6 +18,8 @@ enum class WireType : std::uint8_t {
   kRequestVoteResponse = 2,
   kAppendEntries = 3,
   kAppendEntriesResponse = 4,
+  kInstallSnapshot = 5,
+  kInstallSnapshotResponse = 6,
 };
 
 void append16(std::vector<std::uint8_t>& output, std::uint16_t value) {
@@ -150,7 +152,7 @@ bool encodePayload(const T& rpc, std::vector<std::uint8_t>& payload,
       payload.insert(payload.end(), entry.command.begin(),
                      entry.command.end());
     }
-  } else {
+  } else if constexpr (std::is_same_v<T, raft::AppendEntriesResponse>) {
     append64(payload, rpc.term);
     payload.push_back(rpc.success ? 1U : 0U);
     append64(payload, rpc.request_previous_log_index);
@@ -160,6 +162,25 @@ bool encodePayload(const T& rpc, std::vector<std::uint8_t>& payload,
     payload.push_back(rpc.conflict_term.has_value() ? 1U : 0U);
     append64(payload, rpc.conflict_term.value_or(0));
     append64(payload, rpc.read_context);
+  } else if constexpr (std::is_same_v<T, raft::InstallSnapshotRequest>) {
+    if (rpc.data.size() > RaftProtocol::kMaximumSnapshotChunkSize ||
+        rpc.data.size() >
+            static_cast<std::size_t>(
+                std::numeric_limits<std::uint32_t>::max())) {
+      error = "InstallSnapshot chunk exceeds frame limit";
+      return false;
+    }
+    append64(payload, rpc.term);
+    append64(payload, rpc.leader_id);
+    append64(payload, rpc.last_included_index);
+    append64(payload, rpc.last_included_term);
+    append64(payload, rpc.offset);
+    payload.push_back(rpc.done ? 1U : 0U);
+    append32(payload, static_cast<std::uint32_t>(rpc.data.size()));
+    payload.insert(payload.end(), rpc.data.begin(), rpc.data.end());
+  } else {
+    append64(payload, rpc.term);
+    payload.push_back(rpc.success ? 1U : 0U);
   }
   return true;
 }
@@ -176,8 +197,14 @@ WireType wireType(const raft::RpcPayload& payload) {
         } else if constexpr (
             std::is_same_v<Type, raft::AppendEntriesRequest>) {
           return WireType::kAppendEntries;
-        } else {
+        } else if constexpr (
+            std::is_same_v<Type, raft::AppendEntriesResponse>) {
           return WireType::kAppendEntriesResponse;
+        } else if constexpr (
+            std::is_same_v<Type, raft::InstallSnapshotRequest>) {
+          return WireType::kInstallSnapshot;
+        } else {
+          return WireType::kInstallSnapshotResponse;
         }
       },
       payload);
@@ -245,7 +272,9 @@ bool decodePayload(WireType type, Reader& reader, raft::RpcPayload& output,
             (type_value !=
                  static_cast<std::uint8_t>(raft::EntryType::kNoOp) &&
              type_value !=
-                 static_cast<std::uint8_t>(raft::EntryType::kCommand)) ||
+                 static_cast<std::uint8_t>(raft::EntryType::kCommand) &&
+             type_value !=
+                 static_cast<std::uint8_t>(raft::EntryType::kConfChange)) ||
             !reader.readString(command_size, entry.command)) {
           error = "AppendEntries entry is invalid";
           return false;
@@ -278,6 +307,34 @@ bool decodePayload(WireType type, Reader& reader, raft::RpcPayload& output,
       rpc.request_entry_count = static_cast<std::size_t>(entry_count);
       if (has_conflict_term) {
         rpc.conflict_term = conflict_term;
+      }
+      output = rpc;
+      break;
+    }
+    case WireType::kInstallSnapshot: {
+      raft::InstallSnapshotRequest rpc;
+      std::uint32_t data_size = 0;
+      if (!reader.read64Value(rpc.term) ||
+          !reader.read64Value(rpc.leader_id) ||
+          !reader.read64Value(rpc.last_included_index) ||
+          !reader.read64Value(rpc.last_included_term) ||
+          !reader.read64Value(rpc.offset) ||
+          !readBoolean(reader, rpc.done) ||
+          !reader.read32Value(data_size) ||
+          data_size > RaftProtocol::kMaximumSnapshotChunkSize ||
+          !reader.readString(data_size, rpc.data)) {
+        error = "InstallSnapshot payload is invalid";
+        return false;
+      }
+      output = std::move(rpc);
+      break;
+    }
+    case WireType::kInstallSnapshotResponse: {
+      raft::InstallSnapshotResponse rpc;
+      if (!reader.read64Value(rpc.term) ||
+          !readBoolean(reader, rpc.success)) {
+        error = "InstallSnapshot response is invalid";
+        return false;
       }
       output = rpc;
       break;
@@ -341,7 +398,7 @@ RaftDecodeStatus RaftProtocol::tryDecode(
   const std::uint8_t raw_type = buffer[5];
   if (raw_type < static_cast<std::uint8_t>(WireType::kRequestVote) ||
       raw_type >
-          static_cast<std::uint8_t>(WireType::kAppendEntriesResponse)) {
+          static_cast<std::uint8_t>(WireType::kInstallSnapshotResponse)) {
     error = "unknown Raft RPC message type";
     return RaftDecodeStatus::kError;
   }

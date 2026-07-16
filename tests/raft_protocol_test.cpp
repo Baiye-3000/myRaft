@@ -95,5 +95,68 @@ TEST(RaftProtocolTest, RoundTripsAppendResponse) {
   EXPECT_EQ(decoded.conflict_term, response.conflict_term);
 }
 
+// Verifies InstallSnapshot chunk metadata and binary payload round-trip.
+TEST(RaftProtocolTest, RoundTripsInstallSnapshot) {
+  raft::InstallSnapshotRequest request;
+  request.term = 7;
+  request.leader_id = 2;
+  request.last_included_index = 120;
+  request.last_included_term = 5;
+  request.offset = 4096;
+  request.done = true;
+  request.data = std::string("snap\0chunk", 10);
+  std::vector<std::uint8_t> frame;
+  std::string error;
+  ASSERT_TRUE(
+      RaftProtocol::encode(2, raft::RpcPayload{request}, frame, error))
+      << error;
+
+  RaftMessage message;
+  EXPECT_EQ(RaftProtocol::tryDecode(frame, message, error),
+            RaftDecodeStatus::kComplete)
+      << error;
+  EXPECT_EQ(message.source, 2U);
+  ASSERT_TRUE(
+      std::holds_alternative<raft::InstallSnapshotRequest>(message.payload));
+  const auto& decoded =
+      std::get<raft::InstallSnapshotRequest>(message.payload);
+  EXPECT_EQ(decoded.term, request.term);
+  EXPECT_EQ(decoded.leader_id, request.leader_id);
+  EXPECT_EQ(decoded.last_included_index, request.last_included_index);
+  EXPECT_EQ(decoded.last_included_term, request.last_included_term);
+  EXPECT_EQ(decoded.offset, request.offset);
+  EXPECT_EQ(decoded.done, request.done);
+  EXPECT_EQ(decoded.data, request.data);
+  EXPECT_TRUE(frame.empty());
+}
+
+// Verifies oversized snapshot chunks are rejected before send.
+TEST(RaftProtocolTest, RejectsOversizedSnapshotChunk) {
+  raft::InstallSnapshotRequest request;
+  request.data.assign(RaftProtocol::kMaximumSnapshotChunkSize + 1U, 'x');
+  std::vector<std::uint8_t> frame;
+  std::string error;
+  EXPECT_FALSE(
+      RaftProtocol::encode(1, raft::RpcPayload{request}, frame, error));
+  EXPECT_FALSE(error.empty());
+}
+
+// Verifies InstallSnapshot response fields survive encoding.
+TEST(RaftProtocolTest, RoundTripsInstallSnapshotResponse) {
+  raft::InstallSnapshotResponse response{9, true};
+  std::vector<std::uint8_t> frame;
+  std::string error;
+  ASSERT_TRUE(
+      RaftProtocol::encode(3, raft::RpcPayload{response}, frame, error));
+  RaftMessage message;
+  ASSERT_EQ(RaftProtocol::tryDecode(frame, message, error),
+            RaftDecodeStatus::kComplete)
+      << error;
+  const auto& decoded =
+      std::get<raft::InstallSnapshotResponse>(message.payload);
+  EXPECT_EQ(decoded.term, response.term);
+  EXPECT_EQ(decoded.success, response.success);
+}
+
 }  // namespace
 }  // namespace distributed_kv::network

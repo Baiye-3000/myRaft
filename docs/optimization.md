@@ -159,3 +159,12 @@ Checkpoint 8.4 已完成内存日志的 absolute-index offset 和安全 `compact
 解除 vector 大小随历史 index 增长的约束。该能力尚未接入持久化和自动触发，因此本
 checkpoint 不声明磁盘空间或恢复时间收益；下一步需让 full/delta journal codec 接受
 非零 boundary，并验证 compacted journal 重启。
+
+Checkpoint 8.5 已完成 journal codec 与启动加载的 offset image 支持，并验证 Snapshot +
+compacted journal 可正确重建服务状态。
+
+Checkpoint 8.6 已将 Snapshot 发布与 journal 前缀截断接入 `NodeService`：当
+`lastApplied - lastSnapshotIndex` 达到阈值时，先写 `state.snapshot` 再
+`compactLogPrefix` 持久化截断后的 journal。磁盘收益现可在固定写入负载下通过比较
+`raft.wal` 字节数与重启 replay 记录数测量；InstallSnapshot 完成后可进一步评估落后
+节点追赶成本。

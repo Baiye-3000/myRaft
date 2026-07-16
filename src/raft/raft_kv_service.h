@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "raft/file_snapshot_store.h"
 #include "raft/kv_command.h"
 #include "raft/raft_node.h"
 #include "raft/state_machine.h"
@@ -30,6 +31,12 @@ struct SubmitResult {
   std::vector<OutboundRpc> outbound;
 };
 
+struct SnapshotPublishResult {
+  bool performed{false};
+  LogIndex boundary_index{0};
+  Term boundary_term{0};
+};
+
 /**
  * Composes RaftNode with the replicated KV StateMachine.
  *
@@ -48,7 +55,8 @@ class RaftKVService final {
    */
   RaftKVService(NodeConfig config, storage::KVStore& store,
                 RaftPersistence* persistence = nullptr,
-                const StateMachineSnapshot* snapshot = nullptr);
+                const StateMachineSnapshot* snapshot = nullptr,
+                FileSnapshotStore* snapshot_store = nullptr);
 
   RaftKVService(const RaftKVService&) = delete;
   RaftKVService& operator=(const RaftKVService&) = delete;
@@ -117,6 +125,13 @@ class RaftKVService final {
   [[nodiscard]] SubmitResult submit(const KVCommand& command,
                                     std::string& error);
 
+  [[nodiscard]] ProposeResult proposeConfChange(ConfChangeType type,
+                                                 ClusterMember member,
+                                                 std::uint64_t operation_id = 0);
+
+  [[nodiscard]] bool addLearner(NodeId learner_id);
+  [[nodiscard]] bool learnerCaughtUp(NodeId learner_id) const noexcept;
+
   /**
    * Removes one completed local request result by log index.
    *
@@ -154,7 +169,56 @@ class RaftKVService final {
    */
   [[nodiscard]] LogIndex lastApplied() const noexcept;
 
+  /**
+   * Publishes a state snapshot and compacts the durable Raft journal prefix.
+   *
+   * Input: snapshot store, minimum applied entries since the last publication,
+   * and writable error. Output: result describing whether publication occurred.
+   * Thread safety: owning service event thread only.
+   */
+  [[nodiscard]] bool tryPublishSnapshot(
+      FileSnapshotStore& store, std::size_t entry_threshold,
+      SnapshotPublishResult& result, std::string& error);
+
+  /**
+   * Returns the last included index from startup or the latest publication.
+   *
+   * Input: none. Output: snapshot boundary index.
+   * Thread safety: owning service event thread only.
+   */
+  [[nodiscard]] LogIndex lastSnapshotIndex() const noexcept;
+
+  /**
+   * Handles one InstallSnapshot chunk on a follower.
+   */
+  [[nodiscard]] InstallSnapshotResponse handleInstallSnapshot(
+      const InstallSnapshotRequest& request, FileSnapshotStore& store,
+      std::string& error);
+
+  /**
+   * Processes one InstallSnapshot response on the Leader.
+   */
+  [[nodiscard]] std::vector<OutboundRpc> handleInstallSnapshotResponse(
+      NodeId source, const InstallSnapshotResponse& response,
+      FileSnapshotStore& store, std::string& error);
+
  private:
+  struct LeaderSnapshotSend {
+    LogIndex last_included_index{0};
+    Term last_included_term{0};
+    std::uint64_t offset{0};
+  };
+
+  [[nodiscard]] std::vector<OutboundRpc> completeReplication(
+      std::vector<OutboundRpc> outbound, FileSnapshotStore& store,
+      std::string& error);
+
+  [[nodiscard]] std::optional<OutboundRpc> makeInstallSnapshotRpc(
+      NodeId peer, FileSnapshotStore& store, std::string& error);
+
+  [[nodiscard]] std::vector<OutboundRpc> finalizeOutbound(
+      std::vector<OutboundRpc> outbound, std::string& error);
+
   /**
    * Applies every newly committed entry in strict order.
    *
@@ -168,6 +232,10 @@ class RaftKVService final {
   StateMachine state_machine_;
   std::unordered_set<LogIndex> pending_local_;
   std::unordered_map<LogIndex, ApplyResult> completed_local_;
+  LogIndex last_snapshot_index_{0};
+  FileSnapshotStore* snapshot_store_{nullptr};
+  std::unordered_map<NodeId, LeaderSnapshotSend> snapshot_sends_;
+  std::optional<SnapshotFileReceiver> snapshot_receiver_;
 };
 
 }  // namespace distributed_kv::raft

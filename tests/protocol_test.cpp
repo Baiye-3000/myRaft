@@ -126,6 +126,89 @@ TEST(ProtocolTest, RoundTripsLeaderHint) {
   EXPECT_EQ(actual.leader_port, 7200);
 }
 
+// Verifies ADD_NODE transports a complete client and peer endpoint.
+TEST(ProtocolTest, RoundTripsAddNodeRequest) {
+  Request expected;
+  expected.type = MessageType::kAddNodeRequest;
+  expected.request_id = 101;
+  expected.client_id = 9;
+  expected.operation_id = 9001;
+  expected.node_id = 4;
+  expected.client_host = "127.0.0.1";
+  expected.client_port = 7004;
+  expected.peer_host = "127.0.0.1";
+  expected.peer_port = 8004;
+  std::vector<std::uint8_t> bytes;
+  std::string error;
+  ASSERT_TRUE(Protocol::encodeRequest(expected, bytes, error)) << error;
+  Frame frame;
+  ASSERT_EQ(Protocol::tryDecode(bytes, frame, error),
+            DecodeStatus::kComplete);
+  Request actual;
+  ASSERT_TRUE(Protocol::decodeRequest(frame, actual, error)) << error;
+  EXPECT_EQ(actual.node_id, expected.node_id);
+  EXPECT_EQ(actual.operation_id, expected.operation_id);
+  EXPECT_EQ(actual.client_host, expected.client_host);
+  EXPECT_EQ(actual.client_port, expected.client_port);
+  EXPECT_EQ(actual.peer_host, expected.peer_host);
+  EXPECT_EQ(actual.peer_port, expected.peer_port);
+}
+
+TEST(ProtocolTest, RoundTripsRemoveNodeOperationId) {
+  Request expected;
+  expected.type = MessageType::kRemoveNodeRequest;
+  expected.request_id = 102;
+  expected.client_id = 9;
+  expected.operation_id = 9002;
+  expected.node_id = 4;
+  std::vector<std::uint8_t> bytes;
+  std::string error;
+  ASSERT_TRUE(Protocol::encodeRequest(expected, bytes, error)) << error;
+  Frame frame;
+  ASSERT_EQ(Protocol::tryDecode(bytes, frame, error),
+            DecodeStatus::kComplete);
+  Request actual;
+  ASSERT_TRUE(Protocol::decodeRequest(frame, actual, error)) << error;
+  EXPECT_EQ(actual.operation_id, expected.operation_id);
+  EXPECT_EQ(actual.node_id, expected.node_id);
+}
+
+TEST(ProtocolTest, RejectsInvalidMembershipOperationIds) {
+  Request add;
+  add.type = MessageType::kAddNodeRequest;
+  add.request_id = 103;
+  add.client_id = 9;
+  add.node_id = 4;
+  add.client_host = "127.0.0.1";
+  add.client_port = 7004;
+  add.peer_host = "127.0.0.1";
+  add.peer_port = 8004;
+  std::vector<std::uint8_t> bytes;
+  std::string error;
+  EXPECT_FALSE(Protocol::encodeRequest(add, bytes, error));
+
+  Request get{MessageType::kGetRequest, 104, "key", "", 9};
+  get.operation_id = 9003;
+  EXPECT_FALSE(Protocol::encodeRequest(get, bytes, error));
+}
+
+// Verifies LIST_MEMBERS responses carry machine-readable discovery endpoints.
+TEST(ProtocolTest, RoundTripsMemberDiscovery) {
+  const std::vector<MemberEndpoint> members{
+      {1, "127.0.0.1", 7001, "127.0.0.1", 8001},
+      {2, "127.0.0.1", 7002, "127.0.0.1", 8002}};
+  const Response expected{102, StatusCode::kOk, "OK", {}, 0, members};
+  std::vector<std::uint8_t> bytes;
+  std::string error;
+  ASSERT_TRUE(Protocol::encodeResponse(expected, bytes, error)) << error;
+  Frame frame;
+  ASSERT_EQ(Protocol::tryDecode(bytes, frame, error),
+            DecodeStatus::kComplete);
+  Response actual;
+  ASSERT_TRUE(Protocol::decodeResponse(frame, actual, error)) << error;
+  EXPECT_EQ(actual.members, members);
+}
+
 // Verifies malformed traffic is rejected before body allocation or parsing.
 TEST(ProtocolTest, RejectsInvalidMagic) {
   std::vector<std::uint8_t> bytes;

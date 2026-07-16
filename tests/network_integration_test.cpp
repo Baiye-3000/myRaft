@@ -234,7 +234,7 @@ TEST_F(PersistenceIntegrationTest, RestoresAcknowledgedSetAfterRestart) {
 TEST(NetworkRaftIntegrationTest, RoutesSetThroughSingleNodeRaft) {
   storage::KVStore store;
   raft::RaftKVService service(
-      raft::NodeConfig{1, {}, 100, 100, 20, 64, 1}, store);
+      raft::NodeConfig{1, {}, std::nullopt, 100, 100, 20, 64, 1}, store);
   std::string error;
   const auto election = service.tick(100, error);
   ASSERT_TRUE(election.empty()) << error;

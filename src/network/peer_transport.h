@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +31,7 @@ struct PeerTransportConfig {
   std::uint16_t bind_port{0};
   std::vector<PeerEndpoint> peers;
   int poll_timeout_ms{20};
+  std::string fault_directory;
 };
 
 /**
@@ -63,6 +66,12 @@ class PeerTransport final {
    */
   [[nodiscard]] bool run(const std::atomic<bool>& stop, std::string& error);
 
+  /** Queues an endpoint update for the owning epoll thread. */
+  [[nodiscard]] bool addPeer(PeerEndpoint peer);
+
+  /** Queues removal and connection draining for one peer. */
+  [[nodiscard]] bool removePeer(raft::NodeId peer_id);
+
   /**
    * Closes all descriptors.
    *
@@ -75,12 +84,34 @@ class PeerTransport final {
 
   [[nodiscard]] bool openListener(std::string& error);
   void drainOutbound();
+  void releaseDelayedFrames();
+  void queueFrame(raft::NodeId destination,
+                  std::vector<std::uint8_t> frame);
+  [[nodiscard]] bool faultEnabled(raft::NodeId destination,
+                                  const std::string& action) const;
+  [[nodiscard]] std::chrono::milliseconds faultDelay(
+      raft::NodeId destination) const;
+  void markFaultReached(raft::NodeId destination,
+                        const std::string& action) const;
   void connectMissingPeers();
   void acceptConnections();
   void handleEvent(int fd, std::uint32_t events);
   void processInput(PeerConnection& peer);
   void updateInterest(PeerConnection& peer);
   void closeConnection(int fd);
+  void applyPeerUpdates();
+
+  struct PeerUpdate {
+    bool add{false};
+    PeerEndpoint endpoint;
+    raft::NodeId peer_id{0};
+  };
+
+  struct DelayedFrame {
+    raft::NodeId destination{0};
+    std::vector<std::uint8_t> frame;
+    std::chrono::steady_clock::time_point release_at;
+  };
 
   PeerTransportConfig config_;
   common::BoundedQueue<RaftMessage>& inbound_;
@@ -91,8 +122,11 @@ class PeerTransport final {
   std::unordered_map<raft::NodeId,
                      std::vector<std::vector<std::uint8_t>>>
       pending_frames_;
+  std::vector<DelayedFrame> delayed_frames_;
   int listen_fd_{-1};
   int epoll_fd_{-1};
+  mutable std::mutex update_mutex_;
+  std::vector<PeerUpdate> pending_updates_;
 };
 
 }  // namespace distributed_kv::network

@@ -22,6 +22,7 @@ enum class Role {
 enum class EntryType : std::uint8_t {
   kNoOp = 0,
   kCommand = 1,
+  kConfChange = 2,
 };
 
 struct LogEntry {
@@ -77,9 +78,25 @@ struct AppendEntriesResponse {
   std::uint64_t read_context{0};
 };
 
+struct InstallSnapshotRequest {
+  Term term{0};
+  NodeId leader_id{0};
+  LogIndex last_included_index{0};
+  Term last_included_term{0};
+  std::uint64_t offset{0};
+  bool done{false};
+  std::string data;
+};
+
+struct InstallSnapshotResponse {
+  Term term{0};
+  bool success{false};
+};
+
 using RpcPayload =
     std::variant<RequestVoteRequest, RequestVoteResponse,
-                 AppendEntriesRequest, AppendEntriesResponse>;
+                 AppendEntriesRequest, AppendEntriesResponse,
+                 InstallSnapshotRequest, InstallSnapshotResponse>;
 
 struct OutboundRpc {
   NodeId destination{0};

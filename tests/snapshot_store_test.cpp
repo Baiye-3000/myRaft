@@ -132,5 +132,58 @@ TEST_F(SnapshotStoreTest, RejectsDuplicateStateBeforePublication) {
   EXPECT_EQ(::access(path_.c_str(), F_OK), -1);
 }
 
+TEST_F(SnapshotStoreTest, ReadsSnapshotFileInChunks) {
+  const StateMachineSnapshot expected = sampleSnapshot();
+  FileSnapshotStore store(path_);
+  std::string error;
+  ASSERT_TRUE(store.save(expected, error)) << error;
+
+  std::uint64_t size = 0;
+  ASSERT_TRUE(store.fileSize(size, error)) << error;
+  ASSERT_GT(size, 0U);
+
+  std::string first;
+  bool eof = false;
+  ASSERT_TRUE(store.readBytes(0, 8, first, eof, error)) << error;
+  EXPECT_FALSE(eof);
+  EXPECT_EQ(first.size(), 8U);
+
+  std::string second;
+  ASSERT_TRUE(store.readBytes(first.size(), size, second, eof, error))
+      << error;
+  EXPECT_TRUE(eof);
+  EXPECT_EQ(first.size() + second.size(), size);
+}
+
+TEST_F(SnapshotStoreTest, ReceiverPublishesChunkedSnapshot) {
+  const StateMachineSnapshot expected = sampleSnapshot();
+  FileSnapshotStore store(path_);
+  std::string error;
+  ASSERT_TRUE(store.save(expected, error)) << error;
+
+  std::uint64_t size = 0;
+  ASSERT_TRUE(store.fileSize(size, error)) << error;
+  std::string bytes;
+  bool eof = false;
+  ASSERT_TRUE(store.readBytes(0, size, bytes, eof, error)) << error;
+  ASSERT_TRUE(eof);
+
+  SnapshotFileReceiver receiver(path_);
+  const std::size_t split = bytes.size() / 2U;
+  ASSERT_TRUE(receiver.appendChunk(
+      expected.last_included_index, expected.last_included_term, 0,
+      bytes.substr(0, split), false, error))
+      << error;
+  ASSERT_TRUE(receiver.appendChunk(
+      expected.last_included_index, expected.last_included_term, split,
+      bytes.substr(split), true, error))
+      << error;
+
+  std::optional<StateMachineSnapshot> loaded;
+  ASSERT_TRUE(receiver.finishAndLoad(loaded, error)) << error;
+  ASSERT_TRUE(loaded.has_value());
+  expectEqual(*loaded, expected);
+}
+
 }  // namespace
 }  // namespace distributed_kv::raft

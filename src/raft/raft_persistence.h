@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "raft/cluster_config.h"
 #include "raft/types.h"
 
 namespace distributed_kv::raft {
@@ -13,6 +14,10 @@ struct RaftPersistentState {
   std::optional<NodeId> voted_for;
   std::vector<LogEntry> entries;
   LogIndex commit_index{0};
+  std::optional<ClusterConfiguration> cluster_config;
+  std::optional<ClusterConfiguration> joint_config;
+  std::optional<MembershipOperation> active_membership_operation;
+  std::optional<MembershipOperation> completed_membership_operation;
 };
 
 /**

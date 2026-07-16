@@ -26,6 +26,7 @@ class RaftProtocol final {
  public:
   static constexpr std::size_t kMaximumEntriesPerFrame = 256;
   static constexpr std::size_t kMaximumCommandSize = 1024U * 1024U;
+  static constexpr std::size_t kMaximumSnapshotChunkSize = 1024U * 1024U;
   static constexpr std::size_t kMaximumFrameSize = 2U * 1024U * 1024U;
 
   /**

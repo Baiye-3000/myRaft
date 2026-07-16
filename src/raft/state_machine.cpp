@@ -25,6 +25,15 @@ std::optional<ApplyResult> StateMachine::apply(
     error.clear();
     return std::nullopt;
   }
+  if (entry.type == EntryType::kConfChange) {
+    if (entry.command.empty()) {
+      error = "Raft conf-change entry is empty";
+      return std::nullopt;
+    }
+    last_applied_ = entry.index;
+    error.clear();
+    return std::nullopt;
+  }
   if (entry.type != EntryType::kCommand) {
     error = "unknown Raft entry type";
     return std::nullopt;

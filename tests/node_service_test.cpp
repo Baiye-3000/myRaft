@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -58,14 +59,27 @@ class NodeServiceTest : public ::testing::Test {
     char* created = ::mkdtemp(directory_template.data());
     ASSERT_NE(created, nullptr);
     root_ = created;
-    for (raft::NodeId id = 1; id <= 3; ++id) {
+    std::unordered_set<std::uint16_t> allocated_ports;
+    const auto uniquePort = [&allocated_ports] {
+      std::uint16_t port = 0;
+      do {
+        port = reservePort();
+      } while (port != 0 && !allocated_ports.insert(port).second);
+      return port;
+    };
+    for (raft::NodeId id = 1; id <= 4; ++id) {
       const std::string directory =
           root_ + "/node" + std::to_string(id);
       ASSERT_EQ(::mkdir(directory.c_str(), 0750), 0);
-      members_.push_back(ClusterNodeEndpoint{
-          id, "127.0.0.1", reservePort(), "127.0.0.1", reservePort()});
-      ASSERT_NE(members_.back().client_port, 0);
-      ASSERT_NE(members_.back().peer_port, 0);
+      ClusterNodeEndpoint endpoint{
+          id, "127.0.0.1", uniquePort(), "127.0.0.1", uniquePort()};
+      ASSERT_NE(endpoint.client_port, 0);
+      ASSERT_NE(endpoint.peer_port, 0);
+      if (id <= 3) {
+        members_.push_back(endpoint);
+      } else {
+        learner_endpoint_ = endpoint;
+      }
     }
   }
 
@@ -76,28 +90,48 @@ class NodeServiceTest : public ::testing::Test {
       }
     }
     nodes_.clear();
-    for (raft::NodeId id = 1; id <= 3; ++id) {
+    for (raft::NodeId id = 1; id <= 4; ++id) {
       const std::string directory =
           root_ + "/node" + std::to_string(id);
       static_cast<void>(::unlink((directory + "/raft.wal").c_str()));
       static_cast<void>(::unlink((directory + "/state.snapshot").c_str()));
       static_cast<void>(::unlink((directory + "/state.snapshot.tmp").c_str()));
+      static_cast<void>(::unlink((directory + "/state.snapshot.recv.tmp").c_str()));
       static_cast<void>(::rmdir(directory.c_str()));
     }
     static_cast<void>(::rmdir(root_.c_str()));
   }
 
-  std::unique_ptr<NodeService> makeNode(raft::NodeId id) {
+  std::unique_ptr<NodeService> makeNode(raft::NodeId id,
+                                        std::size_t snapshot_threshold = 64,
+                                        bool late_joiner = false) {
     NodeServiceConfig config;
     config.node_id = id;
     config.data_directory =
         root_ + "/node" + std::to_string(id);
     config.members = members_;
-    config.election_timeout_min_ms = 150 + id * 40;
-    config.election_timeout_max_ms = 250 + id * 40;
+    if (late_joiner) {
+      config.election_timeout_min_ms = 3000;
+      config.election_timeout_max_ms = 5000;
+    } else {
+      config.election_timeout_min_ms = 150 + id * 40;
+      config.election_timeout_max_ms = 250 + id * 40;
+    }
     config.heartbeat_interval_ms = 50;
     config.read_timeout_ms = 1000;
+    config.snapshot_entry_threshold = snapshot_threshold;
     return std::make_unique<NodeService>(std::move(config));
+  }
+
+  void startNodes(const std::vector<raft::NodeId>& ids,
+                  std::size_t snapshot_threshold = 64) {
+    for (const raft::NodeId id : ids) {
+      auto node = makeNode(id, snapshot_threshold);
+      std::string error;
+      ASSERT_TRUE(node->start(error)) << error;
+      nodes_.push_back(std::move(node));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(900));
   }
 
   network::TcpClient makeClient() const {
@@ -111,18 +145,30 @@ class NodeServiceTest : public ::testing::Test {
     return network::TcpClient(std::move(config));
   }
 
-  void startAll() {
-    for (raft::NodeId id = 1; id <= 3; ++id) {
-      auto node = makeNode(id);
-      std::string error;
-      ASSERT_TRUE(node->start(error)) << error;
-      nodes_.push_back(std::move(node));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(900));
+  network::TcpClient makeClientForNode(raft::NodeId id) const {
+    const auto endpoint =
+        std::find_if(members_.begin(), members_.end(),
+                     [id](const ClusterNodeEndpoint& member) {
+                       return member.node_id == id;
+                     });
+    EXPECT_NE(endpoint, members_.end());
+    network::ClientConfig config;
+    config.timeout = std::chrono::milliseconds(5000);
+    config.maximum_attempts = 20;
+    config.endpoints.push_back(
+        network::ClientEndpoint{endpoint->client_host, endpoint->client_port});
+    return network::TcpClient(std::move(config));
+  }
+
+  void startAll() { startNodes({1, 2, 3}); }
+
+  bool pathExists(const std::string& path) const {
+    return ::access(path.c_str(), F_OK) == 0;
   }
 
   std::string root_;
   std::vector<ClusterNodeEndpoint> members_;
+  ClusterNodeEndpoint learner_endpoint_;
   std::vector<std::unique_ptr<NodeService>> nodes_;
 };
 
@@ -141,6 +187,71 @@ TEST_F(NodeServiceTest, ThreeNodesServeReplicatedOperations) {
   EXPECT_EQ(response.status, network::StatusCode::kOk);
   ASSERT_TRUE(client.get("name", response, error)) << error;
   EXPECT_EQ(response.status, network::StatusCode::kNotFound);
+}
+
+// Verifies Admin RPC drives learner catch-up and joint consensus in both
+// directions while the cluster remains available.
+TEST_F(NodeServiceTest, AddsAndRemovesOnlineMember) {
+  startAll();
+  NodeServiceConfig learner_config;
+  learner_config.node_id = learner_endpoint_.node_id;
+  learner_config.data_directory = root_ + "/node4";
+  learner_config.members = members_;
+  learner_config.members.push_back(learner_endpoint_);
+  learner_config.learner = true;
+  learner_config.election_timeout_min_ms = 3000;
+  learner_config.election_timeout_max_ms = 5000;
+  learner_config.heartbeat_interval_ms = 50;
+  auto learner = std::make_unique<NodeService>(std::move(learner_config));
+  std::string error;
+  ASSERT_TRUE(learner->start(error)) << error;
+  nodes_.push_back(std::move(learner));
+
+  auto admin = makeClient();
+  network::Response response;
+  const network::MemberEndpoint member{
+      learner_endpoint_.node_id, learner_endpoint_.client_host,
+      learner_endpoint_.client_port, learner_endpoint_.peer_host,
+      learner_endpoint_.peer_port};
+  constexpr std::uint64_t kAddOperation = 91001;
+  ASSERT_TRUE(admin.addNode(member, response, error, kAddOperation)) << error;
+  ASSERT_EQ(response.status, network::StatusCode::kOk) << response.payload;
+  ASSERT_EQ(response.members.size(), 4U);
+  ASSERT_TRUE(admin.addNode(member, response, error, kAddOperation)) << error;
+  EXPECT_EQ(response.status, network::StatusCode::kOk);
+  EXPECT_EQ(response.payload, "OK_REPLAYED");
+  network::MemberEndpoint conflicting = member;
+  ++conflicting.client_port;
+  ASSERT_TRUE(admin.addNode(conflicting, response, error, kAddOperation))
+      << error;
+  EXPECT_EQ(response.status, network::StatusCode::kInvalidRequest);
+  EXPECT_EQ(response.payload, "OPERATION_ID_REUSED");
+
+  network::ClientConfig direct_config;
+  direct_config.timeout = std::chrono::milliseconds(5000);
+  direct_config.maximum_attempts = 20;
+  direct_config.endpoints.push_back(network::ClientEndpoint{
+      learner_endpoint_.client_host, learner_endpoint_.client_port});
+  network::TcpClient learner_client(std::move(direct_config));
+  ASSERT_TRUE(learner_client.set("expanded", "yes", response, error)) << error;
+  EXPECT_EQ(response.status, network::StatusCode::kOk);
+
+  constexpr std::uint64_t kRemoveOperation = 91002;
+  ASSERT_TRUE(admin.removeNode(learner_endpoint_.node_id, response, error,
+                               kRemoveOperation))
+      << error;
+  ASSERT_EQ(response.status, network::StatusCode::kOk) << response.payload;
+  ASSERT_EQ(response.members.size(), 3U);
+  ASSERT_TRUE(admin.removeNode(learner_endpoint_.node_id, response, error,
+                               kRemoveOperation)) << error;
+  EXPECT_EQ(response.status, network::StatusCode::kOk);
+  EXPECT_EQ(response.payload, "OK_REPLAYED");
+  for (std::size_t attempt = 0; attempt < 50U; ++attempt) {
+    ASSERT_TRUE(admin.listMembers(response, error)) << error;
+    if (response.members.size() == 3U) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  EXPECT_EQ(response.members.size(), 3U);
 }
 
 // Verifies a quorum remains writable and a restarted node reloads its journal.
@@ -224,6 +335,73 @@ TEST_F(NodeServiceTest, BatchesConcurrentLinearizableReads) {
   }
   EXPECT_EQ(total.read_requests, kReaderCount);
   EXPECT_LT(total.read_barriers, total.read_requests);
+}
+
+// Verifies a late-starting node receives InstallSnapshot after journal compaction.
+TEST_F(NodeServiceTest, LaggingNodeInstallsSnapshotAfterJournalCompaction) {
+  constexpr std::size_t kSnapshotThreshold = 2;
+
+  {
+    auto paused = makeNode(3, kSnapshotThreshold, true);
+    std::string error;
+    ASSERT_TRUE(paused->start(error)) << error;
+    paused->stop();
+  }
+  static_cast<void>(::unlink((root_ + "/node3/raft.wal").c_str()));
+  static_cast<void>(::unlink((root_ + "/node3/state.snapshot").c_str()));
+
+  startNodes({1, 2}, kSnapshotThreshold);
+
+  auto client = makeClient();
+  network::Response response;
+  std::string error;
+  ASSERT_TRUE(client.set("alpha", "one", response, error)) << error;
+  ASSERT_EQ(response.status, network::StatusCode::kOk);
+  ASSERT_TRUE(client.set("beta", "two", response, error)) << error;
+  ASSERT_EQ(response.status, network::StatusCode::kOk);
+
+  const std::string leader_snapshot =
+      root_ + "/node1/state.snapshot";
+  const std::string alternate_snapshot =
+      root_ + "/node2/state.snapshot";
+  for (int attempt = 0; attempt < 40; ++attempt) {
+    if (pathExists(leader_snapshot) || pathExists(alternate_snapshot)) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  ASSERT_TRUE(pathExists(leader_snapshot) ||
+              pathExists(alternate_snapshot));
+
+  auto late_node = makeNode(3, kSnapshotThreshold, true);
+  ASSERT_TRUE(late_node->start(error)) << error;
+  nodes_.push_back(std::move(late_node));
+
+  const std::string node3_snapshot = root_ + "/node3/state.snapshot";
+  for (int attempt = 0; attempt < 80; ++attempt) {
+    if (pathExists(node3_snapshot)) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  ASSERT_TRUE(pathExists(node3_snapshot));
+
+  auto node3_client = makeClientForNode(3);
+  ASSERT_TRUE(node3_client.get("alpha", response, error)) << error;
+  EXPECT_EQ(response.payload, "one");
+
+  nodes_[2]->stop();
+  nodes_[2].reset();
+  auto recovered = makeNode(3, kSnapshotThreshold, true);
+  ASSERT_TRUE(recovered->start(error)) << error;
+  nodes_[2] = std::move(recovered);
+  std::this_thread::sleep_for(std::chrono::milliseconds(900));
+
+  auto restarted_client = makeClientForNode(3);
+  ASSERT_TRUE(restarted_client.get("alpha", response, error)) << error;
+  EXPECT_EQ(response.payload, "one");
+  ASSERT_TRUE(restarted_client.get("beta", response, error)) << error;
+  EXPECT_EQ(response.payload, "two");
 }
 
 }  // namespace

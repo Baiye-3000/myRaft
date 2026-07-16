@@ -9,7 +9,7 @@ namespace distributed_kv::network {
 namespace {
 
 constexpr std::array<std::uint8_t, 4> kMagic{{'D', 'K', 'V', '1'}};
-constexpr std::uint8_t kVersion = 1;
+constexpr std::uint8_t kVersion = 3;
 constexpr std::uint16_t kResponseFlag = 1;
 
 // Input: output buffer and host-order value. Output: appended network-order
@@ -106,7 +106,25 @@ bool readString(const std::vector<std::uint8_t>& body, std::size_t& offset,
 bool isRequestType(MessageType type) {
   return type == MessageType::kSetRequest ||
          type == MessageType::kGetRequest ||
+         type == MessageType::kDeleteRequest ||
+         type == MessageType::kAddNodeRequest ||
+         type == MessageType::kRemoveNodeRequest ||
+         type == MessageType::kListMembersRequest;
+}
+
+bool isKvRequestType(MessageType type) {
+  return type == MessageType::kSetRequest ||
+         type == MessageType::kGetRequest ||
          type == MessageType::kDeleteRequest;
+}
+
+bool validEndpoint(std::uint64_t node_id, const std::string& client_host,
+                   std::uint16_t client_port, const std::string& peer_host,
+                   std::uint16_t peer_port) {
+  return node_id != 0 && !client_host.empty() &&
+         client_host.size() <= kMaxHostSize && client_port != 0 &&
+         !peer_host.empty() && peer_host.size() <= kMaxHostSize &&
+         peer_port != 0;
 }
 
 // Input: validated frame fields and body. Output: complete encoded frame or
@@ -159,15 +177,69 @@ bool Protocol::encodeRequest(const Request& request,
     error = "value exceeds protocol limit";
     return false;
   }
+  if (!isKvRequestType(request.type) &&
+      (!request.key.empty() || !request.value.empty())) {
+    error = "admin request must not contain KV fields";
+    return false;
+  }
+  const bool is_membership_request =
+      request.type == MessageType::kAddNodeRequest ||
+      request.type == MessageType::kRemoveNodeRequest;
+  if ((is_membership_request && request.operation_id == 0) ||
+      (!is_membership_request && request.operation_id != 0)) {
+    error = "membership operation id is invalid";
+    return false;
+  }
+
+  if (isKvRequestType(request.type) &&
+      (request.node_id != 0 || !request.client_host.empty() ||
+       request.client_port != 0 || !request.peer_host.empty() ||
+       request.peer_port != 0)) {
+    error = "KV request must not contain member fields";
+    return false;
+  }
+  if (request.type == MessageType::kAddNodeRequest &&
+      !validEndpoint(request.node_id, request.client_host,
+                     request.client_port, request.peer_host,
+                     request.peer_port)) {
+    error = "ADD_NODE endpoint is invalid";
+    return false;
+  }
+  if (request.type == MessageType::kRemoveNodeRequest &&
+      request.node_id == 0) {
+    error = "REMOVE_NODE id is invalid";
+    return false;
+  }
+  if ((request.type == MessageType::kRemoveNodeRequest ||
+       request.type == MessageType::kListMembersRequest) &&
+      (!request.client_host.empty() || request.client_port != 0 ||
+       !request.peer_host.empty() || request.peer_port != 0)) {
+    error = "admin request contains unexpected endpoint";
+    return false;
+  }
+  if (request.type == MessageType::kListMembersRequest &&
+      request.node_id != 0) {
+    error = "LIST_MEMBERS must not contain a node id";
+    return false;
+  }
 
   std::vector<std::uint8_t> body;
-  body.reserve(sizeof(std::uint64_t) + sizeof(std::uint32_t) +
-               request.key.size() +
-               sizeof(std::uint32_t) + request.value.size());
   appendUint64(body, request.client_id);
-  appendString(body, request.key);
-  if (request.type == MessageType::kSetRequest) {
-    appendString(body, request.value);
+  if (isKvRequestType(request.type)) {
+    appendString(body, request.key);
+    if (request.type == MessageType::kSetRequest) {
+      appendString(body, request.value);
+    }
+  } else if (request.type == MessageType::kAddNodeRequest) {
+    appendUint64(body, request.operation_id);
+    appendUint64(body, request.node_id);
+    appendString(body, request.client_host);
+    appendUint16(body, request.client_port);
+    appendString(body, request.peer_host);
+    appendUint16(body, request.peer_port);
+  } else if (request.type == MessageType::kRemoveNodeRequest) {
+    appendUint64(body, request.operation_id);
+    appendUint64(body, request.node_id);
   }
   return encodeFrame(request.type, 0, request.request_id, body, output, error);
 }
@@ -185,6 +257,16 @@ bool Protocol::encodeResponse(const Response& response,
     error = "response leader endpoint is invalid";
     return false;
   }
+  if (response.members.size() > 64U ||
+      std::any_of(response.members.begin(), response.members.end(),
+                  [](const MemberEndpoint& member) {
+                    return !validEndpoint(member.node_id, member.client_host,
+                                          member.client_port, member.peer_host,
+                                          member.peer_port);
+                  })) {
+    error = "response member list is invalid";
+    return false;
+  }
 
   std::vector<std::uint8_t> body;
   body.reserve(1U + sizeof(std::uint32_t) + response.payload.size() +
@@ -194,6 +276,14 @@ bool Protocol::encodeResponse(const Response& response,
   appendString(body, response.payload);
   appendString(body, response.leader_host);
   appendUint16(body, response.leader_port);
+  appendUint16(body, static_cast<std::uint16_t>(response.members.size()));
+  for (const MemberEndpoint& member : response.members) {
+    appendUint64(body, member.node_id);
+    appendString(body, member.client_host);
+    appendUint16(body, member.client_port);
+    appendString(body, member.peer_host);
+    appendUint16(body, member.peer_port);
+  }
   return encodeFrame(MessageType::kResponse, kResponseFlag,
                      response.request_id, body, output, error);
 }
@@ -267,11 +357,64 @@ bool Protocol::decodeRequest(const Frame& frame, Request& request,
   std::size_t offset = sizeof(std::uint64_t);
   std::string key;
   std::string value;
-  if (!readString(frame.body, offset, kMaxKeySize, key, error)) {
-    return false;
+  Request decoded;
+  decoded.type = frame.type;
+  decoded.request_id = frame.request_id;
+  decoded.client_id = client_id;
+  if (isKvRequestType(frame.type)) {
+    if (!readString(frame.body, offset, kMaxKeySize, key, error)) return false;
+    if (frame.type == MessageType::kSetRequest &&
+        !readString(frame.body, offset, kMaxValueSize, value, error)) {
+      return false;
+    }
+    decoded.key = std::move(key);
+    decoded.value = std::move(value);
+  } else if (frame.type == MessageType::kAddNodeRequest) {
+    if (frame.body.size() - offset < 2U * sizeof(std::uint64_t)) {
+      error = "ADD_NODE id is truncated";
+      return false;
+    }
+    decoded.operation_id = readUint64(frame.body.data() + offset);
+    offset += sizeof(std::uint64_t);
+    decoded.node_id = readUint64(frame.body.data() + offset);
+    offset += sizeof(std::uint64_t);
+    if (!readString(frame.body, offset, kMaxHostSize, decoded.client_host,
+                    error) ||
+        frame.body.size() - offset < sizeof(std::uint16_t)) return false;
+    decoded.client_port = readUint16(frame.body.data() + offset);
+    offset += sizeof(std::uint16_t);
+    if (!readString(frame.body, offset, kMaxHostSize, decoded.peer_host,
+                    error) ||
+        frame.body.size() - offset < sizeof(std::uint16_t)) return false;
+    decoded.peer_port = readUint16(frame.body.data() + offset);
+    offset += sizeof(std::uint16_t);
+    if (!validEndpoint(decoded.node_id, decoded.client_host,
+                       decoded.client_port, decoded.peer_host,
+                       decoded.peer_port)) {
+      error = "ADD_NODE endpoint is invalid";
+      return false;
+    }
+  } else if (frame.type == MessageType::kRemoveNodeRequest) {
+    if (frame.body.size() - offset != 2U * sizeof(std::uint64_t)) {
+      error = "REMOVE_NODE id is malformed";
+      return false;
+    }
+    decoded.operation_id = readUint64(frame.body.data() + offset);
+    offset += sizeof(std::uint64_t);
+    decoded.node_id = readUint64(frame.body.data() + offset);
+    offset += sizeof(std::uint64_t);
+    if (decoded.operation_id == 0 || decoded.node_id == 0) {
+      error = "REMOVE_NODE id is invalid";
+      return false;
+    }
   }
-  if (frame.type == MessageType::kSetRequest &&
-      !readString(frame.body, offset, kMaxValueSize, value, error)) {
+  if ((frame.type == MessageType::kAddNodeRequest &&
+       decoded.operation_id == 0) ||
+      (!isKvRequestType(frame.type) &&
+       frame.type != MessageType::kAddNodeRequest &&
+       frame.type != MessageType::kRemoveNodeRequest &&
+       decoded.operation_id != 0)) {
+    error = "membership operation id is invalid";
     return false;
   }
   if (offset != frame.body.size()) {
@@ -279,8 +422,7 @@ bool Protocol::decodeRequest(const Frame& frame, Request& request,
     return false;
   }
 
-  request = Request{frame.type, frame.request_id, std::move(key),
-                    std::move(value), client_id};
+  request = std::move(decoded);
   error.clear();
   return true;
 }
@@ -303,7 +445,7 @@ bool Protocol::decodeResponse(const Frame& frame, Response& response,
   std::string leader_host;
   if (!readString(frame.body, offset, kMaxValueSize, payload, error) ||
       !readString(frame.body, offset, kMaxHostSize, leader_host, error) ||
-      frame.body.size() - offset != sizeof(std::uint16_t)) {
+      frame.body.size() - offset < sizeof(std::uint16_t) * 2U) {
     if (error.empty()) {
       error = "response contains trailing bytes";
     }
@@ -311,14 +453,54 @@ bool Protocol::decodeResponse(const Frame& frame, Response& response,
   }
   const std::uint16_t leader_port =
       readUint16(frame.body.data() + offset);
+  offset += sizeof(std::uint16_t);
   if ((leader_host.empty() && leader_port != 0) ||
       (!leader_host.empty() && leader_port == 0)) {
     error = "response leader endpoint is invalid";
     return false;
   }
 
+  const std::size_t member_count = readUint16(frame.body.data() + offset);
+  offset += sizeof(std::uint16_t);
+  if (member_count > 64U) {
+    error = "response member count is invalid";
+    return false;
+  }
+  std::vector<MemberEndpoint> members;
+  members.reserve(member_count);
+  for (std::size_t index = 0; index < member_count; ++index) {
+    if (frame.body.size() - offset < sizeof(std::uint64_t)) {
+      error = "response member id is truncated";
+      return false;
+    }
+    MemberEndpoint member;
+    member.node_id = readUint64(frame.body.data() + offset);
+    offset += sizeof(std::uint64_t);
+    if (!readString(frame.body, offset, kMaxHostSize, member.client_host,
+                    error) ||
+        frame.body.size() - offset < sizeof(std::uint16_t)) return false;
+    member.client_port = readUint16(frame.body.data() + offset);
+    offset += sizeof(std::uint16_t);
+    if (!readString(frame.body, offset, kMaxHostSize, member.peer_host,
+                    error) ||
+        frame.body.size() - offset < sizeof(std::uint16_t)) return false;
+    member.peer_port = readUint16(frame.body.data() + offset);
+    offset += sizeof(std::uint16_t);
+    if (!validEndpoint(member.node_id, member.client_host, member.client_port,
+                       member.peer_host, member.peer_port)) {
+      error = "response member endpoint is invalid";
+      return false;
+    }
+    members.push_back(std::move(member));
+  }
+  if (offset != frame.body.size()) {
+    error = "response contains trailing bytes";
+    return false;
+  }
+
   response = Response{frame.request_id, status, std::move(payload),
-                      std::move(leader_host), leader_port};
+                      std::move(leader_host), leader_port,
+                      std::move(members)};
   error.clear();
   return true;
 }

@@ -40,6 +40,11 @@ struct NodeServiceConfig {
   std::uint64_t read_timeout_ms{1000};
   std::uint64_t read_batch_window_ms{0};
   std::size_t queue_capacity{4096};
+  std::size_t snapshot_entry_threshold{64};
+  bool learner{false};
+  std::string membership_pause_stage;
+  std::string membership_pause_directory;
+  std::string peer_fault_directory;
 };
 
 struct NodeServiceMetrics {
@@ -107,6 +112,12 @@ class NodeService final {
     std::chrono::steady_clock::time_point deadline;
   };
 
+  struct PendingMembershipChange {
+    std::uint64_t connection_id{0};
+    network::Request request;
+    std::optional<raft::LogIndex> log_index;
+  };
+
   static raft::NodeConfig makeRaftConfig(
       const NodeServiceConfig& config);
   static network::ServerConfig makeServerConfig(
@@ -121,6 +132,10 @@ class NodeService final {
   void processClientRequests(std::string& error);
   void startReadBatchIfReady();
   void completePending();
+  void processMembershipChange();
+  void pauseAtMembershipStage(const std::string& stage);
+  void syncPeerTransport();
+  [[nodiscard]] bool readQuorumReached(const PendingRead& read) const;
   void sendRpcs(std::vector<raft::OutboundRpc> outbound);
   void sendClient(std::uint64_t connection_id,
                   network::Response response);
@@ -141,6 +156,9 @@ class NodeService final {
   network::Server client_server_;
   network::PeerTransport peer_transport_;
   std::unordered_map<raft::LogIndex, PendingWrite> pending_writes_;
+  std::optional<PendingMembershipChange> pending_membership_change_;
+  std::unordered_map<raft::NodeId, network::PeerEndpoint> learner_peers_;
+  std::unordered_map<raft::NodeId, network::PeerEndpoint> transport_peers_;
   std::unordered_map<std::uint64_t, PendingRead> pending_reads_;
   std::vector<network::ClientRequestEvent> deferred_reads_;
   std::optional<std::chrono::steady_clock::time_point> read_batch_started_;

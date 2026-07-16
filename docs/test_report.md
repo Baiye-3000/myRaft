@@ -298,3 +298,125 @@
   index 50 后缀冲突替换、Leader backtrack 不越过 index 40 boundary。
 - 保持：零边界旧日志行为以及全套集群、持久化、线性读测试全部通过。
 - 未覆盖：offset journal round-trip、生产路径 prefix truncation 和 InstallSnapshot。
+
+## Phase 8 — Checkpoint 8.5
+
+- 变更：Raft journal full/delta codec 与 `RaftNode` load 支持非零 Snapshot boundary。
+- Debug：96/96 通过，12.77 秒。
+- Release：96/96 通过，12.64 秒。
+- 新增：index 100 full image round-trip、index 50 delta suffix、Snapshot + index 2
+  compacted journal 服务重启恢复。
+- 修复：`commit_index` 与 absolute `lastIndex` 比较，避免压缩日志被启动拒绝。
+- 未覆盖：InstallSnapshot RPC。
+
+## Phase 8 — Checkpoint 8.6
+
+- 变更：`RaftKVService::tryPublishSnapshot` + `NodeService` 周期触发；boundary 变化时
+  journal 写 full image。
+- Debug：99/99 通过，12.00 秒。
+- Release：99/99 通过，12.62 秒。
+- 新增：阈值门控 Snapshot 发布与 log 前缀截断、发布后 snapshot+journal 重启恢复、
+  boundary 变化 full image round-trip。
+- 保持：三节点选举、持久重启、线性读、多进程故障及 offset journal 测试全部通过。
+- 未覆盖：InstallSnapshot RPC、落后 Follower 被动安装 Snapshot。
+
+## Phase 8 — Checkpoint 8.7.1
+
+- 变更：`InstallSnapshotRequest/Response` 类型与 `RaftProtocol` wire type 5/6 编解码。
+- Debug：102/102 通过，12.80 秒。
+- 新增：InstallSnapshot 分块 round-trip、超大 chunk 拒绝、response round-trip。
+- 未覆盖：Leader 发送、Follower 安装、NodeService 完整接线（8.7.2–8.7.4）。
+
+## Phase 8 — Checkpoint 8.7.2
+
+- 变更：InstallSnapshot 发送/接收核心逻辑；Follower 用 `replaceLogWithSnapshotBoundary`。
+- Debug：107/107 通过，12.53 秒。
+- 新增：snapshot 分块 IO、Leader 向落后 peer 发送、Follower 安装追上、boundary 压缩。
+- 保持：8.7.1 协议测试及全套集群/持久化测试通过。
+- 未覆盖：`node_service_test` 三节点截断后 InstallSnapshot 端到端门禁（8.7.4）。
+
+## Phase 8 — Checkpoint 8.7.4
+
+- 变更：三节点 TCP 集成测试；InstallSnapshot 安装/重启门禁；PeerTransport pending 与
+  offset 重置修复。
+- Debug：108/108 通过，15.07 秒。
+- 新增：`LaggingNodeInstallsSnapshotAfterJournalCompaction`。
+- 保持：8.7.2 单元测试及全套集群/持久化测试通过。
+- Phase 8 Snapshot/InstallSnapshot 收尾完成。
+
+## Phase 9.2 — Joint consensus 核心
+
+- 变更：RaftNode 支持单步 ConfChange、joint 双多数派投票/提交、提交后自动退出 joint，
+  并动态刷新成员资格与复制目标。
+- 新增：`RaftNodeTest.CommitsJointMembershipChangeWithBothMajorities`，覆盖 3→4、重复
+  propose 拒绝和最终稳定配置。
+- Debug：113/113 通过。
+- 未覆盖：Learner/catch-up、运行期 PeerTransport/NodeService 更新、Admin RPC、故障分区。
+
+## Phase 9 — 后续计划
+
+计划文档：[phase9_membership_plan.md](phase9_membership_plan.md)。
+
+预期新增测试：
+
+- 配置编解码与持久化 round-trip。
+- Joint consensus 确定性单测（3→4→3、双多数派 commit、单步拒绝）。
+- Learner catch-up 与 Snapshot 安装后入组。
+- `node_service_test` 在线 ADD/REMOVE。
+- `cluster_process_test` 扩容中 Leader 切换、分区、崩溃恢复（≥6 场景）。
+- `dkv_admin` 端到端脚本门禁。
+
+完成 Phase 9 后，「未覆盖」中的动态成员变更项应移入已覆盖列表。
+
+## Phase 9.3 — Learner/catch-up 核心
+
+- 变更：Learner 可接收日志与 Snapshot，不参与选举和 commit quorum；ADD 前必须追平
+  `commitIndex`。
+- 新增：`RaftNodeTest.LearnerCatchesUpBeforeMembershipChange`。
+- 专项测试：Learner 追赶、禁止投票、追平后 ADD 均通过。
+- 未覆盖：Learner 持久化、PeerTransport 动态 endpoint、NodeService 在线管理、Admin RPC。
+
+## Phase 9.4 — PeerTransport/NodeService 运行期接线
+
+- 变更：PeerTransport 使用线程安全更新队列在 epoll 线程执行 add/remove；NodeService 根据
+  stable/joint 配置同步 endpoint 和连接集合；线性读同步采用 joint 双 quorum。
+- 回归：Debug 全量 `114/114` 通过。
+- 未覆盖：Admin RPC、`dkv_admin`、在线启动新进程的 endpoint 发现与故障分区门禁。
+
+## Phase 9.5 — Admin 工具与在线扩缩容
+
+- 变更：wire protocol v2 增加 ADD/REMOVE/LIST_MEMBERS；`dkv_admin` 支持 Leader hint；
+  `dkv_node --learner` 安全启动待加入节点。
+- 新增：2 个协议 round-trip 测试及
+  `NodeServiceTest.AddsAndRemovesOnlineMember` 真实 TCP 3→4→3 测试。
+- Debug：117/117 通过，16.90 秒。
+- Release：117/117 通过，17.29 秒。
+- 保持：Snapshot/InstallSnapshot、持久重启、线性读、Leader 重选举测试无回归。
+- 未覆盖：成员变更中 Leader 宕机、网络分区、进程崩溃恢复矩阵（Phase 9.6）。
+
+## Phase 9.6 — 故障门禁
+
+- 新增真实进程测试：在线扩容并经新节点访问、四成员 Leader 故障、移除节点隔离、
+  扩容配置和 KV 全量重启恢复、pre-joint/committed-joint Leader 崩溃恢复、仅旧配置
+  多数派存活时禁止提交。成员变更相关真实进程场景共 7 个。
+- 新增确定性测试：joint Leader 切换后恢复退出条目；仅旧配置多数派无法提交 ADD；
+  未提交 joint 条目被覆盖后回滚临时配置；新成员 append joint 后立即成为 voter。
+- 新增持久化故障注入：torn delta 后 stable/joint 配置保持最后完整状态。
+- 手工门禁：`scripts/expand_cluster.sh` 完成 3→4→3，扩容前 KV 数据保持可读。
+- Debug：129/129 通过，42.07 秒。
+- Release：129/129 通过，40.63 秒。
+- Phase 9 动态成员变更测试矩阵完成；剩余非目标为批量变更、自动发现、mTLS/ACL 和
+  多 Raft Group。
+
+## Phase 10.1 — Admin 成员操作幂等化
+
+- 变更：wire protocol v3 为 ADD/REMOVE 增加非零 operation id；ConfChange joint/exit
+  传播同一 ID；Raft 持久化 active 与最近一次 completed 操作。
+- 新增 5 个确定性用例：ADD/REMOVE ID 与非法字段、legacy ConfChange 解码、成员操作状态
+  落盘、joint/exit ID 传播和完成状态重启恢复。
+- 扩展真实 TCP 用例：completed ADD/REMOVE 重放返回 `OK_REPLAYED`，ID 与载荷冲突返回
+  `OPERATION_ID_REUSED`。
+- 扩展真实进程用例：committed-joint Leader 崩溃后以相同 ID 向新 Leader 重试；全量重启
+  后重放最近 completed ADD。
+- Debug：134/134 通过，19.19 秒。
+- Release：134/134 通过，19.30 秒，无新增编译告警。

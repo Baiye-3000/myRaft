@@ -65,6 +65,16 @@ class TcpClient final {
   [[nodiscard]] bool remove(const std::string& key, Response& response,
                             std::string& error);
 
+  [[nodiscard]] bool addNode(const MemberEndpoint& member,
+                             Response& response, std::string& error,
+                             std::uint64_t operation_id = 0);
+
+  [[nodiscard]] bool removeNode(std::uint64_t node_id, Response& response,
+                                std::string& error,
+                                std::uint64_t operation_id = 0);
+
+  [[nodiscard]] bool listMembers(Response& response, std::string& error);
+
   /**
    * Executes one pre-built request over a new bounded-lifetime connection.
    *

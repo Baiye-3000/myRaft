@@ -1,13 +1,17 @@
 #include "network/peer_transport.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <fstream>
 #include <optional>
 #include <utility>
+#include <variant>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
@@ -20,6 +24,7 @@ namespace {
 
 constexpr int kMaximumEvents = 64;
 constexpr std::size_t kMaximumPendingFramesPerPeer = 256;
+constexpr std::size_t kMaximumDelayedFrames = 1024;
 
 bool makeAddress(const std::string& host, std::uint16_t port,
                  sockaddr_in& address) {
@@ -27,6 +32,14 @@ bool makeAddress(const std::string& host, std::uint16_t port,
   address.sin_family = AF_INET;
   address.sin_port = htons(port);
   return ::inet_pton(AF_INET, host.c_str(), &address.sin_addr) == 1;
+}
+
+std::string faultPath(const PeerTransportConfig& config,
+                      raft::NodeId destination,
+                      const std::string& action) {
+  return config.fault_directory + "/peer-" +
+         std::to_string(config.node_id) + "-to-" +
+         std::to_string(destination) + "." + action;
 }
 
 }  // namespace
@@ -119,6 +132,8 @@ bool PeerTransport::run(const std::atomic<bool>& stop, std::string& error) {
   }
   std::array<epoll_event, kMaximumEvents> events{};
   while (!stop.load()) {
+    applyPeerUpdates();
+    releaseDelayedFrames();
     drainOutbound();
     connectMissingPeers();
     const int count =
@@ -145,6 +160,51 @@ bool PeerTransport::run(const std::atomic<bool>& stop, std::string& error) {
   return true;
 }
 
+bool PeerTransport::addPeer(PeerEndpoint peer) {
+  if (peer.node_id == 0 || peer.node_id == config_.node_id ||
+      peer.host.empty() || peer.port == 0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(update_mutex_);
+  pending_updates_.push_back(PeerUpdate{true, std::move(peer), 0});
+  return true;
+}
+
+bool PeerTransport::removePeer(raft::NodeId peer_id) {
+  if (peer_id == 0 || peer_id == config_.node_id) return false;
+  std::lock_guard<std::mutex> lock(update_mutex_);
+  pending_updates_.push_back(PeerUpdate{false, PeerEndpoint{}, peer_id});
+  return true;
+}
+
+void PeerTransport::applyPeerUpdates() {
+  std::vector<PeerUpdate> updates;
+  {
+    std::lock_guard<std::mutex> lock(update_mutex_);
+    updates.swap(pending_updates_);
+  }
+  for (const PeerUpdate& update : updates) {
+    const raft::NodeId peer_id =
+        update.add ? update.endpoint.node_id : update.peer_id;
+    if (!update.add) {
+      endpoints_.erase(peer_id);
+      pending_frames_.erase(peer_id);
+      delayed_frames_.erase(
+          std::remove_if(delayed_frames_.begin(), delayed_frames_.end(),
+                         [peer_id](const DelayedFrame& delayed) {
+                           return delayed.destination == peer_id;
+                         }),
+          delayed_frames_.end());
+      const auto connection = outbound_connections_.find(peer_id);
+      if (connection != outbound_connections_.end()) {
+        closeConnection(connection->second);
+      }
+      continue;
+    }
+    endpoints_[peer_id] = update.endpoint;
+  }
+}
+
 void PeerTransport::drainOutbound() {
   PeerSend send;
   while (outbound_.popFor(send, std::chrono::milliseconds(0))) {
@@ -152,27 +212,107 @@ void PeerTransport::drainOutbound() {
     if (endpoint == endpoints_.end()) {
       continue;
     }
+    if (const auto* install =
+            std::get_if<raft::InstallSnapshotRequest>(&send.payload);
+        install != nullptr && install->offset == 0) {
+      pending_frames_.erase(send.destination);
+    }
     std::vector<std::uint8_t> frame;
     std::string error;
     if (!RaftProtocol::encode(config_.node_id, send.payload, frame, error)) {
       continue;
     }
-    const auto connection = outbound_connections_.find(send.destination);
-    if (connection == outbound_connections_.end()) {
-      auto& pending = pending_frames_[send.destination];
-      if (pending.size() < kMaximumPendingFramesPerPeer) {
-        pending.push_back(std::move(frame));
+    if (faultEnabled(send.destination, "drop")) {
+      markFaultReached(send.destination, "drop");
+      continue;
+    }
+    const bool duplicate = faultEnabled(send.destination, "duplicate");
+    const std::chrono::milliseconds delay = faultDelay(send.destination);
+    if (delay.count() > 0) {
+      markFaultReached(send.destination, "delay");
+      if (delayed_frames_.size() >= kMaximumDelayedFrames) {
+        delayed_frames_.erase(delayed_frames_.begin());
+      }
+      delayed_frames_.push_back(DelayedFrame{
+          send.destination, frame, std::chrono::steady_clock::now() + delay});
+      if (duplicate) {
+        markFaultReached(send.destination, "duplicate");
+        if (delayed_frames_.size() >= kMaximumDelayedFrames) {
+          delayed_frames_.erase(delayed_frames_.begin());
+        }
+        delayed_frames_.push_back(DelayedFrame{
+            send.destination, std::move(frame),
+            std::chrono::steady_clock::now() + delay});
       }
       continue;
     }
-    const auto peer = connections_.find(connection->second);
-    if (peer == connections_.end() ||
-        !peer->second->connection.queueOutput(frame, error)) {
-      closeConnection(connection->second);
+    if (duplicate) {
+      markFaultReached(send.destination, "duplicate");
+      queueFrame(send.destination, frame);
+    }
+    queueFrame(send.destination, std::move(frame));
+  }
+}
+
+void PeerTransport::releaseDelayedFrames() {
+  const auto now = std::chrono::steady_clock::now();
+  for (auto iterator = delayed_frames_.begin();
+       iterator != delayed_frames_.end();) {
+    if (iterator->release_at > now) {
+      ++iterator;
       continue;
     }
-    updateInterest(*peer->second);
+    queueFrame(iterator->destination, std::move(iterator->frame));
+    iterator = delayed_frames_.erase(iterator);
   }
+}
+
+void PeerTransport::queueFrame(raft::NodeId destination,
+                               std::vector<std::uint8_t> frame) {
+  const auto connection = outbound_connections_.find(destination);
+  if (connection == outbound_connections_.end()) {
+    auto& pending = pending_frames_[destination];
+    if (pending.size() >= kMaximumPendingFramesPerPeer) {
+      pending.erase(pending.begin());
+    }
+    pending.push_back(std::move(frame));
+    return;
+  }
+  const auto peer = connections_.find(connection->second);
+  std::string error;
+  if (peer == connections_.end() ||
+      !peer->second->connection.queueOutput(frame, error)) {
+    closeConnection(connection->second);
+    return;
+  }
+  updateInterest(*peer->second);
+}
+
+bool PeerTransport::faultEnabled(raft::NodeId destination,
+                                 const std::string& action) const {
+  return !config_.fault_directory.empty() &&
+         ::access(faultPath(config_, destination, action).c_str(), F_OK) == 0;
+}
+
+std::chrono::milliseconds PeerTransport::faultDelay(
+    raft::NodeId destination) const {
+  if (config_.fault_directory.empty()) return std::chrono::milliseconds(0);
+  std::ifstream input(faultPath(config_, destination, "delay"));
+  std::uint64_t milliseconds = 0;
+  if (!(input >> milliseconds) || milliseconds == 0 ||
+      milliseconds > 60000U) {
+    return std::chrono::milliseconds(0);
+  }
+  return std::chrono::milliseconds(milliseconds);
+}
+
+void PeerTransport::markFaultReached(raft::NodeId destination,
+                                     const std::string& action) const {
+  const std::string path = faultPath(config_, destination, action) +
+                           ".reached";
+  const int descriptor =
+      ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  if (descriptor >= 0) static_cast<void>(::close(descriptor));
 }
 
 void PeerTransport::connectMissingPeers() {
@@ -197,16 +337,7 @@ void PeerTransport::connectMissingPeers() {
     }
     auto connection = std::make_unique<PeerConnection>(
         fd, result != 0, std::optional<raft::NodeId>(item.first));
-    std::string error;
-    auto pending = pending_frames_.find(item.first);
-    if (pending != pending_frames_.end()) {
-      for (const auto& frame : pending->second) {
-        if (!connection->connection.queueOutput(frame, error)) {
-          break;
-        }
-      }
-      pending_frames_.erase(pending);
-    }
+    pending_frames_.erase(item.first);
     epoll_event event {};
     event.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT;
     event.data.fd = fd;

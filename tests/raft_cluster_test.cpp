@@ -29,13 +29,13 @@ class DeterministicCluster {
   DeterministicCluster() {
     nodes_.emplace(
         1, std::make_unique<RaftNode>(
-               NodeConfig{1, {2, 3}, 100, 100, 20, 64, 1}));
+               NodeConfig{1, {2, 3}, std::nullopt, 100, 100, 20, 64, 1}));
     nodes_.emplace(
         2, std::make_unique<RaftNode>(
-               NodeConfig{2, {1, 3}, 200, 200, 20, 64, 2}));
+               NodeConfig{2, {1, 3}, std::nullopt, 200, 200, 20, 64, 2}));
     nodes_.emplace(
         3, std::make_unique<RaftNode>(
-               NodeConfig{3, {1, 2}, 300, 300, 20, 64, 3}));
+               NodeConfig{3, {1, 2}, std::nullopt, 300, 300, 20, 64, 3}));
   }
 
   /**

@@ -181,9 +181,13 @@ bool RaftLog::restore(const std::vector<LogEntry>& entries,
             entries.front().index + static_cast<LogIndex>(index) ||
         entries[index].term == 0 ||
         (entries[index].type != EntryType::kNoOp &&
-         entries[index].type != EntryType::kCommand) ||
+         entries[index].type != EntryType::kCommand &&
+         entries[index].type != EntryType::kConfChange) ||
         (entries[index].type == EntryType::kNoOp &&
-         !entries[index].command.empty())) {
+         !entries[index].command.empty()) ||
+        ((entries[index].type == EntryType::kCommand ||
+          entries[index].type == EntryType::kConfChange) &&
+         entries[index].command.empty())) {
       error = "persistent Raft log is not contiguous and valid";
       return false;
     }
